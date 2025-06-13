@@ -52,22 +52,24 @@ def _normalize_db(amplitude_db: float, db_min: float, db_max: float) -> float:
     return (amplitude_db - db_min) / (db_max - db_min)
 
 class CursesUI:
-    """Full-screen ncurses UI for audio monitoring"""
+    """Full-screen ncurses UI for audio monitoring - htop style"""
     
     def __init__(self):
         self.stdscr = None
         self.running = True
-        self.selected_participant = 0
+        self.selected_row = 0
         self.ui_lock = threading.Lock()
         
         # Colors
-        self.COLOR_LIVE = 1
-        self.COLOR_MUTED = 2
-        self.COLOR_PARTICIPANT = 3
-        self.COLOR_BORDER = 4
-        self.COLOR_METER_LOW = 5
-        self.COLOR_METER_MED = 6
-        self.COLOR_METER_HIGH = 7
+        self.COLOR_HEADER = 1
+        self.COLOR_LIVE = 2
+        self.COLOR_MUTED = 3
+        self.COLOR_PARTICIPANT = 4
+        self.COLOR_SELECTED = 5
+        self.COLOR_METER_LOW = 6
+        self.COLOR_METER_MED = 7
+        self.COLOR_METER_HIGH = 8
+        self.COLOR_STATS = 9
         
     def init_curses(self):
         """Initialize ncurses"""
@@ -81,13 +83,15 @@ class CursesUI:
         # Initialize colors
         if curses.has_colors():
             curses.start_color()
+            curses.init_pair(self.COLOR_HEADER, curses.COLOR_WHITE, curses.COLOR_BLUE)
             curses.init_pair(self.COLOR_LIVE, curses.COLOR_RED, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_MUTED, curses.COLOR_BLACK, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_PARTICIPANT, curses.COLOR_BLUE, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_BORDER, curses.COLOR_CYAN, curses.COLOR_BLACK)
+            curses.init_pair(self.COLOR_MUTED, curses.COLOR_RED, curses.COLOR_BLACK)  # Red X for muted - more visible
+            curses.init_pair(self.COLOR_PARTICIPANT, curses.COLOR_CYAN, curses.COLOR_BLACK)
+            curses.init_pair(self.COLOR_SELECTED, curses.COLOR_BLACK, curses.COLOR_WHITE)
             curses.init_pair(self.COLOR_METER_LOW, curses.COLOR_GREEN, curses.COLOR_BLACK)
             curses.init_pair(self.COLOR_METER_MED, curses.COLOR_YELLOW, curses.COLOR_BLACK)
             curses.init_pair(self.COLOR_METER_HIGH, curses.COLOR_RED, curses.COLOR_BLACK)
+            curses.init_pair(self.COLOR_STATS, curses.COLOR_BLUE, curses.COLOR_BLACK)
     
     def cleanup_curses(self):
         """Cleanup ncurses"""
@@ -97,65 +101,165 @@ class CursesUI:
             curses.echo()
             curses.endwin()
     
-    def draw_box(self, y, x, height, width, title=""):
-        """Draw a box with optional title"""
-        # Draw box border
-        for i in range(height):
-            for j in range(width):
-                if i == 0 or i == height - 1:
-                    if j == 0:
-                        char = "┌" if i == 0 else "└"
-                    elif j == width - 1:
-                        char = "┐" if i == 0 else "┘"
-                    else:
-                        char = "─"
-                elif j == 0 or j == width - 1:
-                    char = "│"
-                else:
-                    continue
-                
-                try:
-                    self.stdscr.addstr(y + i, x + j, char, curses.color_pair(self.COLOR_BORDER))
-                except curses.error:
-                    pass
+    def draw_header(self, width, streamer):
+        """Draw header bar similar to htop with mute status"""
+        # Get mute status
+        with streamer.mute_lock:
+            is_muted = streamer.is_muted
         
-        # Add title
-        if title:
-            title_text = f"─ {title} "
-            remaining_width = max(0, width - len(title_text) - 2)
-            title_line = title_text + "─" * remaining_width
-            try:
-                self.stdscr.addstr(y, x + 1, title_line[:width-2], curses.color_pair(self.COLOR_BORDER))
-            except curses.error:
-                pass
-    
-    def draw_meter(self, y, x, width, level_db, max_width=40):
-        """Draw a dB meter bar"""
-        # Normalize dB level to 0-1 range
-        normalized = _normalize_db(level_db, db_min=INPUT_DB_MIN, db_max=INPUT_DB_MAX)
-        bar_width = min(max_width, width - 10)  # Leave space for dB value
-        filled_width = int(normalized * bar_width)
+        # Create header text with mute status
+        mute_status = " [MUTED] " if is_muted else " [●LIVE] "
+        base_text = "LiveKit Audio Monitor"
+        controls_text = "Press 'q' to quit, 'm' to toggle mute"
         
-        # Choose color based on level
-        if normalized > 0.75:
-            color = curses.color_pair(self.COLOR_METER_HIGH)
-        elif normalized > 0.5:
-            color = curses.color_pair(self.COLOR_METER_MED)
-        else:
-            color = curses.color_pair(self.COLOR_METER_LOW)
+        header_text = f"{base_text}{mute_status}- {controls_text}"
         
-        # Draw meter bar - use wider fixed width for dB display
-        meter_str = "█" * filled_width + "░" * (bar_width - filled_width)
-        db_str = f"[{level_db:6.1f}]"  # Changed from 5.1f to 6.1f for wider range
+        # Center the header text
+        padding = max(0, (width - len(header_text)) // 2)
+        header_line = " " * padding + header_text + " " * (width - padding - len(header_text))
         
         try:
-            self.stdscr.addstr(y, x, db_str)
-            self.stdscr.addstr(y, x + 8, meter_str, color)
+            # Draw the base hea
+            self.stdscr.addstr(0, 0, " " * width, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
+            
+            # Draw parts with different colors
+            if padding > 0:
+                self.stdscr.addstr(0, 0, " " * padding, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
+            
+            # Base text
+            text_x = padding
+            self.stdscr.addstr(0, text_x, base_text, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
+            text_x += len(base_text)
+            
+            # Mute status with appropriate color
+            if is_muted:
+                mute_color = curses.color_pair(self.COLOR_MUTED) | curses.A_BOLD | curses.A_REVERSE
+            else:
+                mute_color = curses.color_pair(self.COLOR_LIVE) | curses.A_BOLD | curses.A_REVERSE
+            
+            self.stdscr.addstr(0, text_x, mute_status, mute_color)
+            text_x += len(mute_status)
+            
+            # Rest of header
+            remaining_text = f"- {controls_text}"
+            remaining_width = width - text_x
+            if len(remaining_text) <= remaining_width:
+                self.stdscr.addstr(0, text_x, remaining_text, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
+                text_x += len(remaining_text)
+            
+            # Fill remaining space
+            if text_x < width:
+                self.stdscr.addstr(0, text_x, " " * (width - text_x), curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
+                
+        except curses.error:
+            pass
+    
+    def draw_participant_row(self, y, x, width, name, status, db_level, is_selected=False, is_local=False):
+        """Draw a single participant row"""
+        if y >= curses.LINES:
+            return
+            
+        # Background color for selected row
+        bg_attr = curses.color_pair(self.COLOR_SELECTED) if is_selected else 0
+        
+        # Status indicator - more distinct visual differences
+        if is_local:
+            if status == "MUTED":
+                status_char = "✕"  # X mark for muted
+                status_color = curses.color_pair(self.COLOR_MUTED) | bg_attr | curses.A_BOLD
+            else:
+                status_char = "●"  # Solid dot for live
+                status_color = curses.color_pair(self.COLOR_LIVE) | bg_attr | curses.A_BOLD
+        else:
+            status_char = "●"
+            status_color = curses.color_pair(self.COLOR_PARTICIPANT) | bg_attr
+        
+        # For muted local microphone, use a different dB level for meter display
+        display_db_level = db_level
+        if is_local and status == "MUTED":
+            display_db_level = INPUT_DB_MIN  # Show no activity when muted
+        
+        # Calculate meter
+        normalized = _normalize_db(display_db_level, db_min=INPUT_DB_MIN, db_max=INPUT_DB_MAX)
+        meter_width = min(30, width - 30)  # Leave more space for status text
+        filled_width = int(normalized * meter_width)
+        
+        # Choose meter color based on level and mute status
+        if is_local and status == "MUTED":
+            meter_color = curses.color_pair(self.COLOR_MUTED) | bg_attr  # Gray for muted
+        elif normalized > 0.75:
+            meter_color = curses.color_pair(self.COLOR_METER_HIGH) | bg_attr
+        elif normalized > 0.5:
+            meter_color = curses.color_pair(self.COLOR_METER_MED) | bg_attr
+        else:
+            meter_color = curses.color_pair(self.COLOR_METER_LOW) | bg_attr
+        
+        # Clear the entire row first if selected
+        if is_selected:
+            try:
+                self.stdscr.addstr(y, 0, " " * width, bg_attr)
+            except curses.error:
+                pass
+        
+        # Draw the row components
+        try:
+            # Status indicator
+            self.stdscr.addstr(y, x, status_char, status_color)
+            
+            # Status text for local participant
+            if is_local:
+                status_text = f"[{status}]"
+                status_text_color = status_color
+                self.stdscr.addstr(y, x + 2, status_text, status_text_color)
+                name_start_x = x + 2 + len(status_text) + 1
+            else:
+                name_start_x = x + 2
+            
+            # Participant name (truncated to fit)
+            name_width = 12
+            display_name = name[:name_width].ljust(name_width)
+            name_color = bg_attr if is_selected else 0
+            self.stdscr.addstr(y, name_start_x, display_name, name_color)
+            
+            # dB value - show actual level even when muted for monitoring
+            db_text = f"{db_level:6.1f}dB"
+            db_x = name_start_x + name_width + 1
+            self.stdscr.addstr(y, db_x, db_text, name_color)
+            
+            # Meter bar
+            meter_x = db_x + len(db_text) + 1
+            if meter_x < width:
+                available_width = width - meter_x
+                actual_meter_width = min(meter_width, available_width)
+                actual_filled = int((filled_width / meter_width) * actual_meter_width) if meter_width > 0 else 0
+                
+                # Different meter display for muted
+                if is_local and status == "MUTED":
+                    meter_bar = "▓" * actual_meter_width  # Solid gray bar when muted
+                else:
+                    meter_bar = "█" * actual_filled + "░" * (actual_meter_width - actual_filled)
+                
+                self.stdscr.addstr(y, meter_x, meter_bar, meter_color)
+                
+        except curses.error:
+            pass
+    
+    def draw_stats_line(self, y, width, streamer):
+        """Draw statistics line at the bottom"""
+        with streamer.participants_lock:
+            participant_count = len(streamer.participants)
+        
+        stats_text = f"Queue: {streamer.audio_input_queue.qsize():>3} | Participants: {participant_count:>2} | " \
+                    f"In: {streamer.input_callback_count:>6} | Out: {streamer.output_callback_count:>6} | " \
+                    f"Processed: {streamer.frames_processed:>5}"
+        
+        try:
+            self.stdscr.addstr(y, 0, stats_text[:width], curses.color_pair(self.COLOR_STATS))
         except curses.error:
             pass
     
     def draw_interface(self, streamer):
-        """Draw the complete interface"""
+        """Draw the complete htop-style interface"""
         with self.ui_lock:
             if not self.stdscr:
                 return
@@ -163,99 +267,63 @@ class CursesUI:
             height, width = self.stdscr.getmaxyx()
             self.stdscr.clear()
             
-            current_y = 0
+            # Draw header
+            self.draw_header(width, streamer)
             
-            # Local microphone section
-            box_height = 5
-            self.draw_box(current_y, 0, box_height, width, "Local Microphone")
+            current_y = 2  # Start below header with some space
             
-            # Mute status indicator
+            # Collect all participants (local + remote)
+            participants = []
+            
+            # Add local microphone first
             with streamer.mute_lock:
                 is_muted = streamer.is_muted
             
-            status_char = "●"
-            status_text = "MUTED" if is_muted else "LIVE"
-            status_color = curses.color_pair(self.COLOR_MUTED if is_muted else self.COLOR_LIVE)
+            local_status = "MUTED" if is_muted else "LIVE"
+            participants.append({
+                'name': f"Local ({streamer.input_device_name[:8]})",
+                'status': local_status,
+                'db_level': streamer.micro_db,
+                'is_local': True,
+                'participant_id': 'local'
+            })
             
-            try:
-                self.stdscr.addstr(current_y + 1, 2, status_char, status_color)
-                self.stdscr.addstr(current_y + 1, 4, status_text, status_color)
-                self.stdscr.addstr(current_y + 1, 11, f"Mic ")
-            except curses.error:
-                pass
-            
-            # Local microphone meter
-            self.draw_meter(current_y + 1, 15, width - 17, streamer.micro_db)
-            
-            # Device info
-            try:
-                device_text = f"Device: {streamer.input_device_name}"
-                self.stdscr.addstr(current_y + 2, 2, device_text[:width-4])
-            except curses.error:
-                pass
-            
-            current_y += box_height + 1
-            
-            # Participants section
-            max_participants = min(10, height - current_y - 8)  # Leave space for stats and controls
-            participants_height = max_participants + 2
-            self.draw_box(current_y, 0, participants_height, width, "Remote Participants")
-            
-            # Draw participants
-            participant_y = current_y + 1
+            # Add remote participants
             with streamer.participants_lock:
-                participants_list = list(streamer.participants.items())
+                for participant_id, info in streamer.participants.items():
+                    participants.append({
+                        'name': info['name'],
+                        'status': 'LIVE',
+                        'db_level': info['db_level'],
+                        'is_local': False,
+                        'participant_id': participant_id
+                    })
             
-            if participants_list:
-                for i, (participant_id, info) in enumerate(participants_list[:max_participants]):
-                    if participant_y >= current_y + participants_height - 1:
-                        break
-                    
-                    # Participant indicator
-                    try:
-                        self.stdscr.addstr(participant_y, 2, "●", curses.color_pair(self.COLOR_PARTICIPANT))
-                        
-                        # Participant name (truncated to fit)
-                        name = info['name'][:12]
-                        self.stdscr.addstr(participant_y, 4, name)
-                        
-                        # Participant meter
-                        self.draw_meter(participant_y, 18, width - 20, info['db_level'])
-                        
-                    except curses.error:
-                        pass
-                    
-                    participant_y += 1
-            else:
-                try:
-                    self.stdscr.addstr(participant_y, 2, "No remote participants connected")
-                except curses.error:
-                    pass
-            
-            current_y += participants_height + 1
-            
-            # Statistics section
-            stats_height = 4
-            self.draw_box(current_y, 0, stats_height, width, "Statistics")
-            
-            try:
-                stats_line1 = f"Input Callbacks: {streamer.input_callback_count:>6}   Output Callbacks: {streamer.output_callback_count:>6}   Queue: {streamer.audio_input_queue.qsize():>3}"
-                stats_line2 = f"Frames Processed: {streamer.frames_processed:>5}  Frames Sent: {streamer.frames_sent_to_livekit:>5}        Participants: {len(participants_list):>2}"
+            # Draw participant rows
+            max_rows = height - 4  # Leave space for header and stats
+            for i, participant in enumerate(participants[:max_rows]):
+                if current_y >= height - 2:  # Leave space for stats
+                    break
                 
-                self.stdscr.addstr(current_y + 1, 2, stats_line1[:width-4])
-                self.stdscr.addstr(current_y + 2, 2, stats_line2[:width-4])
-            except curses.error:
-                pass
+                is_selected = (i == self.selected_row)
+                self.draw_participant_row(
+                    current_y, 0, width,
+                    participant['name'],
+                    participant['status'],
+                    participant['db_level'],
+                    is_selected,
+                    participant['is_local']
+                )
+                current_y += 1
             
-            current_y += stats_height + 1
+            # Draw stats at bottom
+            if height > 3:
+                self.draw_stats_line(height - 2, width, streamer)
             
-            # Controls section
-            controls_height = 3
-            self.draw_box(current_y, 0, controls_height, width, "Controls")
-            
+            # Controls hint at very bottom
+            controls_text = "Controls: M=Mute Q=Quit ↑↓=Navigate"
             try:
-                controls_text = "M - Toggle Mute    Q - Quit    ↑/↓ - Navigate    R - Refresh"
-                self.stdscr.addstr(current_y + 1, 2, controls_text[:width-4])
+                self.stdscr.addstr(height - 1, 0, controls_text[:width])
             except curses.error:
                 pass
             
@@ -278,12 +346,16 @@ class CursesUI:
             elif key == ord('r') or key == ord('R'):
                 return 'refresh'
             elif key == curses.KEY_UP:
-                self.selected_participant = max(0, self.selected_participant - 1)
+                # Get total participant count
+                with streamer.participants_lock:
+                    total_participants = len(streamer.participants) + 1  # +1 for local mic
+                self.selected_row = max(0, self.selected_row - 1)
                 return 'nav_up'
             elif key == curses.KEY_DOWN:
+                # Get total participant count
                 with streamer.participants_lock:
-                    max_participants = len(streamer.participants)
-                self.selected_participant = min(max_participants - 1, self.selected_participant + 1)
+                    total_participants = len(streamer.participants) + 1  # +1 for local mic
+                self.selected_row = min(total_participants - 1, self.selected_row + 1)
                 return 'nav_down'
         except curses.error:
             pass
@@ -368,9 +440,6 @@ class AudioStreamer:
             # Get device info - but override input device to use working microphone
             input_device, output_device = sd.default.device
             
-            # Override to use DC Microphone (device 1) which is working
-            #input_device = 1  # DC Microphone
-            
             self.logger.info(f"Using input device: {input_device}, output device: {output_device}")
             
             if input_device is not None:
@@ -444,7 +513,11 @@ class AudioStreamer:
         with self.mute_lock:
             self.is_muted = not self.is_muted
             status = "MUTED" if self.is_muted else "LIVE"
-            self.logger.info(f"Microphone {status}")
+            self.logger.info(f"=== MICROPHONE {status} ===")
+            
+            # Also log to console if in debug mode for immediate feedback
+            if self.logger.isEnabledFor(logging.DEBUG):
+                print(f"\n>>> MICROPHONE {status} <<<", flush=True)
 
     def start_keyboard_handler(self):
         """Start keyboard input handler in a separate thread"""
@@ -765,7 +838,7 @@ class AudioStreamer:
                 sys.stdout.write("\033[2K\r\033[?25h")
                 sys.stdout.flush()
 
-async def main(participant_name: str, enable_aec: bool = True):
+async def main(participant_name: str, enable_aec: bool = True, use_curses: bool = True):
     logger = logging.getLogger(__name__)
     logger.info("=== STARTING AUDIO STREAMER ===")
     
@@ -781,7 +854,7 @@ async def main(participant_name: str, enable_aec: bool = True):
         return
     
     # Create audio streamer with loop reference
-    streamer = AudioStreamer(enable_aec, loop=loop)
+    streamer = AudioStreamer(enable_aec, loop=loop, use_curses=use_curses)
     
     # Create room
     room = rtc.Room(loop=loop)
@@ -822,6 +895,30 @@ async def main(participant_name: str, enable_aec: bool = True):
             streamer.print_audio_meter()
             await asyncio.sleep(1 / FPS)
         logger.info("Meter task ended")
+    
+    # Keyboard handling task for curses
+    async def keyboard_task():
+        """Handle keyboard input for curses UI"""
+        if not use_curses or not streamer.ui:
+            return
+            
+        logger.info("Keyboard task started")
+        while streamer.running:
+            try:
+                action = streamer.ui.handle_keyboard(streamer)
+                if action == 'quit':
+                    logger.info("Quit requested by user")
+                    streamer.running = False
+                    break
+                elif action:
+                    logger.debug(f"Keyboard action: {action}")
+                    
+                await asyncio.sleep(0.05)  # Check keyboard 20 times per second
+            except Exception as e:
+                logger.error(f"Error in keyboard task: {e}")
+                break
+        
+        logger.info("Keyboard task ended")
     
     # Function to handle received audio frames
     async def receive_audio_frames(stream: rtc.AudioStream, participant: rtc.RemoteParticipant):
@@ -932,9 +1029,10 @@ async def main(participant_name: str, enable_aec: bool = True):
         logger.info("Starting audio devices...")
         streamer.start_audio_devices()
         
-        # Start keyboard handler
-        logger.info("Starting keyboard handler...")
-        streamer.start_keyboard_handler()
+        # Start keyboard handler (only for non-curses mode)
+        if not use_curses:
+            logger.info("Starting keyboard handler...")
+            streamer.start_keyboard_handler()
         
         # Initialize terminal for stable UI
         streamer.init_terminal()
@@ -962,8 +1060,14 @@ async def main(participant_name: str, enable_aec: bool = True):
         
         # Start background tasks
         logger.info("Starting background tasks...")
-        audio_task = asyncio.create_task(audio_processing_task())
-        meter_display_task = asyncio.create_task(meter_task())
+        tasks = [
+            asyncio.create_task(audio_processing_task()),
+            asyncio.create_task(meter_task()),
+        ]
+        
+        # Add keyboard task for curses mode
+        if use_curses:
+            tasks.append(asyncio.create_task(keyboard_task()))
         
         logger.info("=== Audio streaming started. Press Ctrl+C to stop. ===")
         
@@ -983,22 +1087,17 @@ async def main(participant_name: str, enable_aec: bool = True):
         logger.info("Starting cleanup...")
         streamer.running = False
         
-        if 'audio_task' in locals():
-            audio_task.cancel()
+        # Cancel all tasks
+        for task in tasks if 'tasks' in locals() else []:
+            task.cancel()
             try:
-                await audio_task
-            except asyncio.CancelledError:
-                pass
-        
-        if 'meter_display_task' in locals():
-            meter_display_task.cancel()
-            try:
-                await meter_display_task
+                await task
             except asyncio.CancelledError:
                 pass
         
         streamer.stop_audio_devices()
-        streamer.stop_keyboard_handler()
+        if not use_curses:
+            streamer.stop_keyboard_handler()
         await room.disconnect()
         
         # Clear the meter line
@@ -1024,6 +1123,11 @@ if __name__ == "__main__":
         "--debug",
         action="store_true",
         help="Enable debug logging"
+    )
+    parser.add_argument(
+        "--simple-ui",
+        action="store_true",
+        help="Use simple terminal UI instead of curses interface"
     )
     args = parser.parse_args()
     
@@ -1063,7 +1167,7 @@ if __name__ == "__main__":
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        main_task = asyncio.ensure_future(main(args.name, enable_aec=not args.disable_aec))
+        main_task = asyncio.ensure_future(main(args.name, enable_aec=not args.disable_aec, use_curses=not args.simple_ui))
         for signal in [SIGINT, SIGTERM]:
             loop.add_signal_handler(signal, signal_handler)
 
