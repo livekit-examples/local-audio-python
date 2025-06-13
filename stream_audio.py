@@ -108,7 +108,7 @@ class CursesUI:
             is_muted = streamer.is_muted
         
         # Create header text with mute status
-        mute_status = " [MUTED] " if is_muted else " [●LIVE] "
+        mute_status = " [MUTE] " if is_muted else " [LIVE] "
         base_text = "LiveKit Audio Monitor"
         controls_text = "Press 'q' to quit, 'm' to toggle mute"
         
@@ -164,7 +164,7 @@ class CursesUI:
         
         # Status indicator - more distinct visual differences
         if is_local:
-            if status == "MUTED":
+            if status == "MUTE":
                 status_char = "✕"  # X mark for muted
                 status_color = curses.color_pair(self.COLOR_MUTED) | bg_attr | curses.A_BOLD
             else:
@@ -176,7 +176,7 @@ class CursesUI:
         
         # For muted local microphone, use a different dB level for meter display
         display_db_level = db_level
-        if is_local and status == "MUTED":
+        if is_local and status == "MUTE":
             display_db_level = INPUT_DB_MIN  # Show no activity when muted
         
         # Calculate meter
@@ -185,7 +185,7 @@ class CursesUI:
         filled_width = int(normalized * meter_width)
         
         # Choose meter color based on level and mute status
-        if is_local and status == "MUTED":
+        if is_local and status == "MUTE":
             meter_color = curses.color_pair(self.COLOR_MUTED) | bg_attr  # Gray for muted
         elif normalized > 0.75:
             meter_color = curses.color_pair(self.COLOR_METER_HIGH) | bg_attr
@@ -234,7 +234,7 @@ class CursesUI:
                 actual_filled = int((filled_width / meter_width) * actual_meter_width) if meter_width > 0 else 0
                 
                 # Different meter display for muted
-                if is_local and status == "MUTED":
+                if is_local and status == "MUTE":
                     meter_bar = "▓" * actual_meter_width  # Solid gray bar when muted
                 else:
                     meter_bar = "█" * actual_filled + "░" * (actual_meter_width - actual_filled)
@@ -279,7 +279,7 @@ class CursesUI:
             with streamer.mute_lock:
                 is_muted = streamer.is_muted
             
-            local_status = "MUTED" if is_muted else "LIVE"
+            local_status = "MUTE" if is_muted else "LIVE"
             participants.append({
                 'name': f"Local ({streamer.input_device_name[:8]})",
                 'status': local_status,
@@ -434,9 +434,6 @@ class AudioStreamer:
         try:
             self.logger.info("Starting audio devices...")
             
-            # List all devices for debugging
-            list_audio_devices()
-            
             # Get device info - but override input device to use working microphone
             input_device, output_device = sd.default.device
             
@@ -512,7 +509,7 @@ class AudioStreamer:
         """Toggle microphone mute state"""
         with self.mute_lock:
             self.is_muted = not self.is_muted
-            status = "MUTED" if self.is_muted else "LIVE"
+            status = "MUTE" if self.is_muted else "LIVE"
             self.logger.info(f"=== MICROPHONE {status} ===")
             
             # Also log to console if in debug mode for immediate feedback
