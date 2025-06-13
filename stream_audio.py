@@ -83,15 +83,16 @@ class CursesUI:
         # Initialize colors
         if curses.has_colors():
             curses.start_color()
+            curses.use_default_colors()  # Use terminal's default colors (black background)
             curses.init_pair(self.COLOR_HEADER, curses.COLOR_WHITE, curses.COLOR_BLUE)
-            curses.init_pair(self.COLOR_LIVE, curses.COLOR_RED, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_MUTED, curses.COLOR_RED, curses.COLOR_BLACK)  # Red X for muted - more visible
-            curses.init_pair(self.COLOR_PARTICIPANT, curses.COLOR_CYAN, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_SELECTED, curses.COLOR_BLACK, curses.COLOR_WHITE)
-            curses.init_pair(self.COLOR_METER_LOW, curses.COLOR_GREEN, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_METER_MED, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_METER_HIGH, curses.COLOR_RED, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_STATS, curses.COLOR_BLUE, curses.COLOR_BLACK)
+            curses.init_pair(self.COLOR_LIVE, curses.COLOR_RED, -1)  # Red on default (black) background
+            curses.init_pair(self.COLOR_MUTED, curses.COLOR_WHITE, -1)  # Gray/white on default background
+            curses.init_pair(self.COLOR_PARTICIPANT, curses.COLOR_CYAN, -1)  # Cyan on default background
+            curses.init_pair(self.COLOR_SELECTED, curses.COLOR_BLACK, curses.COLOR_WHITE)  # Keep selection highlight
+            curses.init_pair(self.COLOR_METER_LOW, curses.COLOR_GREEN, -1)  # Green on default background
+            curses.init_pair(self.COLOR_METER_MED, curses.COLOR_YELLOW, -1)  # Yellow on default background
+            curses.init_pair(self.COLOR_METER_HIGH, curses.COLOR_RED, -1)  # Red on default background
+            curses.init_pair(self.COLOR_STATS, curses.COLOR_BLUE, -1)  # Blue on default background
     
     def cleanup_curses(self):
         """Cleanup ncurses"""
@@ -109,7 +110,7 @@ class CursesUI:
         
         # Create header text with mute status
         mute_status = " [MUTE] " if is_muted else " [LIVE] "
-        base_text = "LiveKit Audio Monitor"
+        base_text = "LiveKit Audio Chat"
         controls_text = "Press 'q' to quit, 'm' to toggle mute"
         
         header_text = f"{base_text}{mute_status}- {controls_text}"
@@ -162,14 +163,14 @@ class CursesUI:
         # Background color for selected row
         bg_attr = curses.color_pair(self.COLOR_SELECTED) if is_selected else 0
         
-        # Status indicator - more distinct visual differences
+        # Status indicator - red dot for live, gray dot for muted
         if is_local:
             if status == "MUTE":
-                status_char = "✕"  # X mark for muted
-                status_color = curses.color_pair(self.COLOR_MUTED) | bg_attr | curses.A_BOLD
+                status_char = "●"  # Solid dot
+                status_color = curses.color_pair(self.COLOR_MUTED) | bg_attr | curses.A_DIM  # Gray/dim for muted
             else:
-                status_char = "●"  # Solid dot for live
-                status_color = curses.color_pair(self.COLOR_LIVE) | bg_attr | curses.A_BOLD
+                status_char = "●"  # Solid dot
+                status_color = curses.color_pair(self.COLOR_LIVE) | bg_attr | curses.A_BOLD  # Red for live
         else:
             status_char = "●"
             status_color = curses.color_pair(self.COLOR_PARTICIPANT) | bg_attr
@@ -184,15 +185,15 @@ class CursesUI:
         meter_width = min(30, width - 30)  # Leave more space for status text
         filled_width = int(normalized * meter_width)
         
-        # Choose meter color based on level and mute status
+        # Choose meter color based on level - green/yellow/red scaling
         if is_local and status == "MUTE":
-            meter_color = curses.color_pair(self.COLOR_MUTED) | bg_attr  # Gray for muted
+            meter_color = curses.color_pair(self.COLOR_MUTED) | bg_attr | curses.A_DIM  # Gray for muted
         elif normalized > 0.75:
-            meter_color = curses.color_pair(self.COLOR_METER_HIGH) | bg_attr
-        elif normalized > 0.5:
-            meter_color = curses.color_pair(self.COLOR_METER_MED) | bg_attr
+            meter_color = curses.color_pair(self.COLOR_METER_HIGH) | bg_attr  # Red for high levels
+        elif normalized > 0.4:
+            meter_color = curses.color_pair(self.COLOR_METER_MED) | bg_attr   # Yellow for medium levels
         else:
-            meter_color = curses.color_pair(self.COLOR_METER_LOW) | bg_attr
+            meter_color = curses.color_pair(self.COLOR_METER_LOW) | bg_attr   # Green for low levels
         
         # Clear the entire row first if selected
         if is_selected:
@@ -235,7 +236,7 @@ class CursesUI:
                 
                 # Different meter display for muted
                 if is_local and status == "MUTE":
-                    meter_bar = "▓" * actual_meter_width  # Solid gray bar when muted
+                    meter_bar = "░" * actual_meter_width  # Light shade when muted
                 else:
                     meter_bar = "█" * actual_filled + "░" * (actual_meter_width - actual_filled)
                 
@@ -281,7 +282,7 @@ class CursesUI:
             
             local_status = "MUTE" if is_muted else "LIVE"
             participants.append({
-                'name': f"Local ({streamer.input_device_name[:8]})",
+                'name': streamer.get_local_participant_name(),
                 'status': local_status,
                 'db_level': streamer.micro_db,
                 'is_local': True,
@@ -783,7 +784,7 @@ class AudioStreamer:
             live_indicator = f"{_esc(1, 38, 2, 255, 0, 0)}●{_esc(0)} "   # Bright red dot
         
         # Local mic part
-        local_part = f"{live_indicator}Mic[{self.micro_db:6.1f}]{_esc(color_code)}[{bar}]{_esc(0)}"
+        local_part = f"{live_indicator}{self.get_local_participant_name()[:8]}[{self.micro_db:6.1f}]{_esc(color_code)}[{bar}]{_esc(0)}"
         meter_parts.append(local_part)
         
         # Add participant meters (compact format)
@@ -834,6 +835,12 @@ class AudioStreamer:
                 # Clear the meter line and show cursor
                 sys.stdout.write("\033[2K\r\033[?25h")
                 sys.stdout.flush()
+
+    def get_local_participant_name(self):
+        """Get the local participant identity from the room, with fallback"""
+        if self.room and self.room.local_participant:
+            return self.room.local_participant.identity or "not connected"
+        return "not connected"
 
 async def main(participant_name: str, enable_aec: bool = True, use_curses: bool = True):
     logger = logging.getLogger(__name__)
