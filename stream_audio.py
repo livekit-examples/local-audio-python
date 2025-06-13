@@ -84,14 +84,22 @@ class CursesUI:
         if curses.has_colors():
             curses.start_color()
             curses.use_default_colors()  # Use terminal's default colors (black background)
+            
+            # Use bright colors if available
+            red_color = curses.COLOR_RED
+            if hasattr(curses, 'COLOR_BRIGHT_RED') and curses.COLORS >= 16:
+                red_color = curses.COLOR_BRIGHT_RED
+            elif curses.COLORS >= 16:
+                red_color = 9  # Bright red in 16-color mode
+            
             curses.init_pair(self.COLOR_HEADER, curses.COLOR_WHITE, curses.COLOR_BLUE)
-            curses.init_pair(self.COLOR_LIVE, curses.COLOR_RED, -1)  # Red on default (black) background
+            curses.init_pair(self.COLOR_LIVE, red_color, -1)  # Use bright red when available
             curses.init_pair(self.COLOR_MUTED, curses.COLOR_WHITE, -1)  # Gray/white on default background
             curses.init_pair(self.COLOR_PARTICIPANT, curses.COLOR_CYAN, -1)  # Cyan on default background
             curses.init_pair(self.COLOR_SELECTED, curses.COLOR_BLACK, curses.COLOR_WHITE)  # Keep selection highlight
             curses.init_pair(self.COLOR_METER_LOW, curses.COLOR_GREEN, -1)  # Green on default background
             curses.init_pair(self.COLOR_METER_MED, curses.COLOR_YELLOW, -1)  # Yellow on default background
-            curses.init_pair(self.COLOR_METER_HIGH, curses.COLOR_RED, -1)  # Red on default background
+            curses.init_pair(self.COLOR_METER_HIGH, red_color, -1)  # Use same bright red
             curses.init_pair(self.COLOR_STATS, curses.COLOR_BLUE, -1)  # Blue on default background
     
     def cleanup_curses(self):
@@ -108,19 +116,18 @@ class CursesUI:
         with streamer.mute_lock:
             is_muted = streamer.is_muted
         
-        # Create header text with mute status
+        # Create header text with mute status - removed redundant controls text
         mute_status = " [MUTE] " if is_muted else " [LIVE] "
         base_text = "LiveKit Audio Chat"
-        controls_text = "Press 'q' to quit, 'm' to toggle mute"
         
-        header_text = f"{base_text}{mute_status}- {controls_text}"
+        header_text = f"{base_text}{mute_status}"
         
         # Center the header text
         padding = max(0, (width - len(header_text)) // 2)
         header_line = " " * padding + header_text + " " * (width - padding - len(header_text))
         
         try:
-            # Draw the base hea
+            # Draw the base header
             self.stdscr.addstr(0, 0, " " * width, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
             
             # Draw parts with different colors
@@ -141,13 +148,6 @@ class CursesUI:
             self.stdscr.addstr(0, text_x, mute_status, mute_color)
             text_x += len(mute_status)
             
-            # Rest of header
-            remaining_text = f"- {controls_text}"
-            remaining_width = width - text_x
-            if len(remaining_text) <= remaining_width:
-                self.stdscr.addstr(0, text_x, remaining_text, curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
-                text_x += len(remaining_text)
-            
             # Fill remaining space
             if text_x < width:
                 self.stdscr.addstr(0, text_x, " " * (width - text_x), curses.color_pair(self.COLOR_HEADER) | curses.A_BOLD)
@@ -160,20 +160,21 @@ class CursesUI:
         if y >= curses.LINES:
             return
             
-        # Background color for selected row
-        bg_attr = curses.color_pair(self.COLOR_SELECTED) if is_selected else 0
+        # Selection indicator - use ">" instead of background highlighting
+        selection_indicator = ">" if is_selected else " "
+        selection_color = curses.color_pair(self.COLOR_LIVE) | curses.A_BOLD if is_selected else 0
         
         # Status indicator - red dot for live, gray dot for muted
         if is_local:
             if status == "MUTE":
                 status_char = "●"  # Solid dot
-                status_color = curses.color_pair(self.COLOR_MUTED) | bg_attr | curses.A_DIM  # Gray/dim for muted
+                status_color = curses.color_pair(self.COLOR_MUTED) | curses.A_DIM  # Gray/dim for muted
             else:
                 status_char = "●"  # Solid dot
-                status_color = curses.color_pair(self.COLOR_LIVE) | bg_attr | curses.A_BOLD  # Red for live
+                status_color = curses.color_pair(self.COLOR_LIVE) | curses.A_BOLD  # Bright red for live
         else:
             status_char = "●"
-            status_color = curses.color_pair(self.COLOR_PARTICIPANT) | bg_attr
+            status_color = curses.color_pair(self.COLOR_PARTICIPANT)
         
         # For muted local microphone, use a different dB level for meter display
         display_db_level = db_level
@@ -182,44 +183,40 @@ class CursesUI:
         
         # Calculate meter
         normalized = _normalize_db(display_db_level, db_min=INPUT_DB_MIN, db_max=INPUT_DB_MAX)
-        meter_width = min(30, width - 30)  # Leave more space for status text
+        meter_width = min(30, width - 35)  # Adjust for selection indicator space
         filled_width = int(normalized * meter_width)
         
         # Choose meter color based on level - green/yellow/red scaling
         if is_local and status == "MUTE":
-            meter_color = curses.color_pair(self.COLOR_MUTED) | bg_attr | curses.A_DIM  # Gray for muted
+            meter_color = curses.color_pair(self.COLOR_MUTED) | curses.A_DIM  # Gray for muted
         elif normalized > 0.75:
-            meter_color = curses.color_pair(self.COLOR_METER_HIGH) | bg_attr  # Red for high levels
+            meter_color = curses.color_pair(self.COLOR_METER_HIGH)  # Red for high levels
         elif normalized > 0.4:
-            meter_color = curses.color_pair(self.COLOR_METER_MED) | bg_attr   # Yellow for medium levels
+            meter_color = curses.color_pair(self.COLOR_METER_MED)   # Yellow for medium levels
         else:
-            meter_color = curses.color_pair(self.COLOR_METER_LOW) | bg_attr   # Green for low levels
-        
-        # Clear the entire row first if selected
-        if is_selected:
-            try:
-                self.stdscr.addstr(y, 0, " " * width, bg_attr)
-            except curses.error:
-                pass
+            meter_color = curses.color_pair(self.COLOR_METER_LOW)   # Green for low levels
         
         # Draw the row components
         try:
+            # Selection indicator first
+            self.stdscr.addstr(y, x, selection_indicator, selection_color)
+            
             # Status indicator
-            self.stdscr.addstr(y, x, status_char, status_color)
+            self.stdscr.addstr(y, x + 1, status_char, status_color)
             
             # Status text for local participant
             if is_local:
                 status_text = f"[{status}]"
                 status_text_color = status_color
-                self.stdscr.addstr(y, x + 2, status_text, status_text_color)
-                name_start_x = x + 2 + len(status_text) + 1
+                self.stdscr.addstr(y, x + 3, status_text, status_text_color)
+                name_start_x = x + 3 + len(status_text) + 1
             else:
-                name_start_x = x + 2
+                name_start_x = x + 3
             
             # Participant name (truncated to fit)
             name_width = 12
             display_name = name[:name_width].ljust(name_width)
-            name_color = bg_attr if is_selected else 0
+            name_color = 0  # Normal color, no special highlighting
             self.stdscr.addstr(y, name_start_x, display_name, name_color)
             
             # dB value - show actual level even when muted for monitoring
