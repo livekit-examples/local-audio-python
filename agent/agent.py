@@ -60,10 +60,16 @@ async def entrypoint(ctx: agents.JobContext):
     @ctx.room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant) -> None:
         logging.info("participant connected: %s %s", participant.sid, participant.identity)
+        if participant.identity == "phone":
+            room_io.set_participant(participant.identity)
+            logging.info("phone connected, using 'phone' audio stream")
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
         logging.info("participant disconnected: %s %s", participant.sid, participant.identity)
+        if participant.identity == "phone":
+            room_io.set_participant("robot")
+            logging.info("phone disconnected, using 'robot' audio stream")
     
 
     await session.start(
@@ -71,9 +77,6 @@ async def entrypoint(ctx: agents.JobContext):
         agent=Assistant(),
         room_input_options=RoomInputOptions(
             participant_identity='robot',
-            # LiveKit Cloud enhanced noise cancellation
-            # - If self-hosting, omit this parameter
-            # - For telephony applications, use `BVCTelephony` for best results
             noise_cancellation=noise_cancellation.BVC(), 
             close_on_disconnect=False,
         ),

@@ -201,9 +201,25 @@ class CursesUI:
             participants_height = max_participants + 2
             self.draw_box(current_y, 0, participants_height, width, "Remote Participants")
             
-            # Draw participants
+            # Draw participants with cleanup logic
             participant_y = current_y + 1
+            current_time = time.time()
             with streamer.participants_lock:
+                # Clean up stale participants (same logic as simple meter)
+                participants_to_remove = []
+                for participant_id, info in list(streamer.participants.items()):
+                    time_since_update = current_time - info['last_update']
+                    
+                    if not info.get('has_audio', False) and time_since_update > 10.0:
+                        participants_to_remove.append(participant_id)
+                    elif info.get('has_audio', False) and time_since_update > 2.0:
+                        info['has_audio'] = False
+                        info['db_level'] = INPUT_DB_MIN
+                
+                # Remove stale participants
+                for participant_id in participants_to_remove:
+                    del streamer.participants[participant_id]
+                
                 participants_list = list(streamer.participants.items())
             
             if participants_list:
@@ -211,13 +227,24 @@ class CursesUI:
                     if participant_y >= current_y + participants_height - 1:
                         break
                     
-                    # Participant indicator
+                    # Participant indicator with audio status
                     try:
-                        self.stdscr.addstr(participant_y, 2, "●", curses.color_pair(self.COLOR_PARTICIPANT))
+                        # Use different colors based on audio status
+                        if info.get('has_audio', False):
+                            # Active audio - bright blue
+                            indicator_color = curses.color_pair(self.COLOR_PARTICIPANT)
+                            status_char = "●"
+                        else:
+                            # No audio - dimmed
+                            indicator_color = curses.color_pair(self.COLOR_MUTED)
+                            status_char = "○"
+                        
+                        self.stdscr.addstr(participant_y, 2, status_char, indicator_color)
                         
                         # Participant name (truncated to fit)
                         name = info['name'][:12]
-                        self.stdscr.addstr(participant_y, 4, name)
+                        name_color = curses.color_pair(self.COLOR_PARTICIPANT) if info.get('has_audio', False) else curses.color_pair(self.COLOR_MUTED)
+                        self.stdscr.addstr(participant_y, 4, name, name_color)
                         
                         # Participant meter
                         self.draw_meter(participant_y, 18, width - 20, info['db_level'])
@@ -342,7 +369,7 @@ class AudioStreamer:
         self.input_device_name = "Microphone"
         
         # Participant tracking for dB meters
-        self.participants = {}  # participant_id -> {'name': str, 'db_level': float, 'last_update': float}
+        self.participants = {}  # participant_id -> {'name': str, 'db_level': float, 'last_update': float, 'has_audio': bool}
         self.participants_lock = threading.Lock()
         
         # Control flags
@@ -719,11 +746,21 @@ class AudioStreamer:
         # Add participant meters (compact format)
         current_time = time.time()
         with self.participants_lock:
+            participants_to_remove = []
             for participant_id, info in list(self.participants.items()):
-                # Remove stale participants (no audio for 5 seconds)
-                if current_time - info['last_update'] > 5.0:
-                    del self.participants[participant_id]
+                # More intelligent cleanup logic:
+                # - Remove participants who have been disconnected and haven't had audio for 2 seconds
+                # - Keep participants who are connected but not speaking (has_audio=False) for longer (10 seconds)
+                time_since_update = current_time - info['last_update']
+                
+                if not info.get('has_audio', False) and time_since_update > 10.0:
+                    # Participant hasn't had audio for 10 seconds, remove them
+                    participants_to_remove.append(participant_id)
                     continue
+                elif info.get('has_audio', False) and time_since_update > 2.0:
+                    # Participant has audio but hasn't been updated recently, mark as no audio
+                    info['has_audio'] = False
+                    info['db_level'] = INPUT_DB_MIN
                 
                 # Calculate participant meter
                 participant_amplitude_db = _normalize_db(info['db_level'], db_min=INPUT_DB_MIN, db_max=INPUT_DB_MAX)
@@ -732,10 +769,20 @@ class AudioStreamer:
                 participant_color_code = 31 if participant_amplitude_db > 0.75 else 33 if participant_amplitude_db > 0.5 else 32
                 participant_bar = "#" * participant_nb_bar + "-" * ((MAX_AUDIO_BAR // 2) - participant_nb_bar)
                 
-                participant_indicator = f"{_esc(94)}●{_esc(0)} "  # Blue dot for remote participants
+                # Use different indicator based on audio status
+                if info.get('has_audio', False):
+                    participant_indicator = f"{_esc(94)}●{_esc(0)} "  # Blue dot for participants with audio
+                else:
+                    participant_indicator = f"{_esc(90)}●{_esc(0)} "  # Gray dot for participants without audio
                 
                 participant_part = f"{participant_indicator}{info['name'][:6]}[{info['db_level']:6.1f}]{_esc(participant_color_code)}[{participant_bar}]{_esc(0)}"
                 meter_parts.append(participant_part)
+            
+            # Remove stale participants
+            for participant_id in participants_to_remove:
+                removed_name = self.participants[participant_id]['name']
+                del self.participants[participant_id]
+                self.logger.debug(f"Removed stale participant from meter: {removed_name}")
         
         # Join status info at the beginning with all parts
         meter_text = status_info + " ".join(meter_parts)
@@ -834,45 +881,59 @@ async def main(participant_name: str, enable_aec: bool = True):
         
         logger.info(f"Receiving audio from participant: {participant_name} ({participant_id})")
         
-        async for frame_event in stream:
-            if not streamer.running:
-                break
-                
-            frames_received += 1
-            if frames_received <= 5:
-                logger.info(f"Received audio frame {frames_received} from {participant_name}")
-            elif frames_received % 100 == 0:
-                logger.info(f"Received {frames_received} frames total from {participant_name}")
-                
-            # Calculate dB level for this participant
-            frame_data = frame_event.frame.data
-            if len(frame_data) > 0:
-                # Convert to numpy array for dB calculation
-                audio_samples = np.frombuffer(frame_data, dtype=np.int16)
-                if len(audio_samples) > 0:
-                    rms = np.sqrt(np.mean(audio_samples.astype(np.float32) ** 2))
-                    max_int16 = np.iinfo(np.int16).max
-                    participant_db = 20.0 * np.log10(rms / max_int16 + 1e-6)
+        try:
+            async for frame_event in stream:
+                if not streamer.running:
+                    break
                     
-                    # Update participant info
-                    with streamer.participants_lock:
-                        streamer.participants[participant_id] = {
-                            'name': participant_name,
-                            'db_level': participant_db,
-                            'last_update': time.time()
-                        }
-                
-            # Add received audio to output buffer
-            audio_data = frame_event.frame.data.tobytes()
-            with streamer.output_lock:
-                streamer.output_buffer.extend(audio_data)
-        
-        logger.info(f"Audio receive task ended for {participant_name}. Total frames received: {frames_received}")
-        
-        # Clean up participant when stream ends
-        with streamer.participants_lock:
-            if participant_id in streamer.participants:
-                del streamer.participants[participant_id]
+                frames_received += 1
+                if frames_received <= 5:
+                    logger.info(f"Received audio frame {frames_received} from {participant_name}")
+                elif frames_received % 100 == 0:
+                    logger.info(f"Received {frames_received} frames total from {participant_name}")
+                    
+                # Calculate dB level for this participant
+                frame_data = frame_event.frame.data
+                if len(frame_data) > 0:
+                    # Convert to numpy array for dB calculation
+                    audio_samples = np.frombuffer(frame_data, dtype=np.int16)
+                    if len(audio_samples) > 0:
+                        rms = np.sqrt(np.mean(audio_samples.astype(np.float32) ** 2))
+                        max_int16 = np.iinfo(np.int16).max
+                        participant_db = 20.0 * np.log10(rms / max_int16 + 1e-6)
+                        
+                        # Update participant info
+                        with streamer.participants_lock:
+                            if participant_id in streamer.participants:
+                                streamer.participants[participant_id]['db_level'] = participant_db
+                                streamer.participants[participant_id]['last_update'] = time.time()
+                                streamer.participants[participant_id]['has_audio'] = True
+                            else:
+                                # Participant might have been added after track subscription
+                                streamer.participants[participant_id] = {
+                                    'name': participant_name,
+                                    'db_level': participant_db,
+                                    'last_update': time.time(),
+                                    'has_audio': True
+                                }
+                    
+                # Add received audio to output buffer
+                audio_data = frame_event.frame.data.tobytes()
+                with streamer.output_lock:
+                    streamer.output_buffer.extend(audio_data)
+                    
+        except Exception as e:
+            logger.error(f"Error in receive_audio_frames for {participant_name}: {e}")
+        finally:
+            logger.info(f"Audio receive task ended for {participant_name}. Total frames received: {frames_received}")
+            
+            # Mark participant as not having audio when stream ends, but don't remove them
+            # They will be removed when they actually disconnect
+            with streamer.participants_lock:
+                if participant_id in streamer.participants:
+                    streamer.participants[participant_id]['has_audio'] = False
+                    streamer.participants[participant_id]['db_level'] = INPUT_DB_MIN
+                    logger.info(f"Marked participant {participant_name} as not having audio (stream ended)")
 
     # Event handlers
     @room.on("track_subscribed")
@@ -884,8 +945,36 @@ async def main(participant_name: str, enable_aec: bool = True):
         logger.info("track subscribed: %s from participant %s (%s)", publication.sid, participant.sid, participant.identity)
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info(f"Starting audio stream for participant: {participant.identity}")
+            # Ensure participant is in our tracking when audio track starts
+            with streamer.participants_lock:
+                if participant.sid not in streamer.participants:
+                    streamer.participants[participant.sid] = {
+                        'name': participant.identity or f"User_{participant.sid[:8]}",
+                        'db_level': INPUT_DB_MIN,
+                        'last_update': time.time(),
+                        'has_audio': True
+                    }
+                else:
+                    # Update existing participant to indicate they now have audio
+                    streamer.participants[participant.sid]['has_audio'] = True
+                    
             audio_stream = rtc.AudioStream(track, sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS)
             asyncio.ensure_future(receive_audio_frames(audio_stream, participant))
+
+    @room.on("track_unsubscribed")
+    def on_track_unsubscribed(
+        track: rtc.Track,
+        publication: rtc.RemoteTrackPublication,
+        participant: rtc.RemoteParticipant,
+    ):
+        logger.info("track unsubscribed: %s from participant %s (%s)", publication.sid, participant.sid, participant.identity)
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            logger.info(f"Audio track unsubscribed for participant: {participant.identity}")
+            # Mark participant as not having audio but keep them in tracking
+            with streamer.participants_lock:
+                if participant.sid in streamer.participants:
+                    streamer.participants[participant.sid]['has_audio'] = False
+                    streamer.participants[participant.sid]['db_level'] = INPUT_DB_MIN
 
     @room.on("track_published")
     def on_track_published(
@@ -897,27 +986,80 @@ async def main(participant_name: str, enable_aec: bool = True):
             participant.sid,
             participant.identity,
         )
+        
+        # Only subscribe to tracks from participants whose identity starts with "agent"
+        if participant.identity and participant.identity.startswith("agent"):
+            logger.info(f"Subscribing to track from agent participant: {participant.identity}")
+            publication.set_subscribed(True)
+        else:
+            logger.info(f"Ignoring track from non-agent participant: {participant.identity}")
+
+    @room.on("track_unpublished")
+    def on_track_unpublished(
+        publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant
+    ):
+        logger.info(
+            "track unpublished: %s from participant %s (%s)",
+            publication.sid,
+            participant.sid,
+            participant.identity,
+        )
+        
+        # Explicitly unsubscribe from the unpublished track
+        if publication.subscribed:
+            logger.info(f"Unsubscribing from unpublished track: {publication.sid}")
+            publication.set_subscribed(False)
+        
+        # If this was an audio track, mark participant as not having audio
+        if publication.kind == rtc.TrackKind.KIND_AUDIO:
+            logger.info(f"Audio track unpublished for participant: {participant.identity}")
+            with streamer.participants_lock:
+                if participant.sid in streamer.participants:
+                    streamer.participants[participant.sid]['has_audio'] = False
+                    streamer.participants[participant.sid]['db_level'] = INPUT_DB_MIN
 
     @room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
         logger.info("participant connected: %s %s", participant.sid, participant.identity)
-        # Initialize participant in our tracking
+        # Initialize participant in our tracking immediately when they connect
         with streamer.participants_lock:
             streamer.participants[participant.sid] = {
                 'name': participant.identity or f"User_{participant.sid[:8]}",
                 'db_level': INPUT_DB_MIN,
-                'last_update': time.time()
+                'last_update': time.time(),
+                'has_audio': False  # Will be set to True when audio track is subscribed
             }
-        logger.info(f"Added participant to tracking: {participant.identity}")
+        logger.info(f"Added participant to tracking: {participant.identity or 'Unknown'}")
 
     @room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
         logger.info("participant disconnected: %s %s", participant.sid, participant.identity)
-        # Remove participant from our tracking
+        
+        # Explicitly unsubscribe from all tracks for this participant
+        for publication in participant.track_publications.values():
+            if isinstance(publication, rtc.RemoteTrackPublication) and publication.subscribed:
+                logger.info(f"Unsubscribing from track {publication.sid} due to participant disconnect")
+                publication.set_subscribed(False)
+        
+        # Remove participant from our tracking immediately
         with streamer.participants_lock:
             if participant.sid in streamer.participants:
+                participant_name = streamer.participants[participant.sid]['name']
                 del streamer.participants[participant.sid]
-                logger.info(f"Removed participant from tracking: {participant.identity}")
+                logger.info(f"Removed participant from tracking: {participant_name}")
+            else:
+                logger.warning(f"Participant {participant.sid} not found in tracking when disconnecting")
+
+    @room.on("participant_name_changed")  
+    def on_participant_name_changed(participant: rtc.RemoteParticipant):
+        logger.info("participant name changed: %s %s", participant.sid, participant.identity)
+        # Update participant name in our tracking
+        with streamer.participants_lock:
+            if participant.sid in streamer.participants:
+                old_name = streamer.participants[participant.sid]['name']
+                new_name = participant.identity or f"User_{participant.sid[:8]}"
+                streamer.participants[participant.sid]['name'] = new_name
+                logger.info(f"Updated participant name: {old_name} -> {new_name}")
 
     @room.on("connected")
     def on_connected():
@@ -926,6 +1068,11 @@ async def main(participant_name: str, enable_aec: bool = True):
     @room.on("disconnected")
     def on_disconnected(reason):
         logger.info(f"Disconnected from LiveKit room: {reason}")
+        # Clear all participants when disconnected
+        with streamer.participants_lock:
+            participant_count = len(streamer.participants)
+            streamer.participants.clear()
+            logger.info(f"Cleared {participant_count} participants from tracking due to disconnect")
 
     try:
         # Start audio devices
@@ -944,8 +1091,19 @@ async def main(participant_name: str, enable_aec: bool = True):
         token = generate_token(ROOM_NAME, participant_name, participant_name)
         logger.info(f"Generated token for participant: {participant_name}")
         
-        await room.connect(LIVEKIT_URL, token)
+        # Disable auto-subscribe to manually control track subscriptions
+        connect_options = rtc.RoomOptions(auto_subscribe=False)
+        await room.connect(LIVEKIT_URL, token, options=connect_options)
         logger.info("connected to room %s", room.name)
+        
+        # Subscribe to tracks from existing agent participants
+        for participant in room.remote_participants.values():
+            if participant.identity and participant.identity.startswith("agent"):
+                logger.info(f"Found existing agent participant: {participant.identity}")
+                for publication in participant.track_publications.values():
+                    if isinstance(publication, rtc.RemoteTrackPublication):
+                        logger.info(f"Subscribing to existing track from agent: {participant.identity}")
+                        publication.set_subscribed(True)
         
         # Publish microphone track
         logger.info("Publishing microphone track...")
