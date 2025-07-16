@@ -201,24 +201,17 @@ class CursesUI:
             participants_height = max_participants + 2
             self.draw_box(current_y, 0, participants_height, width, "Remote Participants")
             
-            # Draw participants with cleanup logic
+            # Draw participants 
             participant_y = current_y + 1
             current_time = time.time()
             with streamer.participants_lock:
-                # Clean up stale participants (same logic as simple meter)
-                participants_to_remove = []
+                # Simple timeout logic to mark participants as not currently speaking
                 for participant_id, info in list(streamer.participants.items()):
                     time_since_update = current_time - info['last_update']
-                    
-                    if not info.get('has_audio', False) and time_since_update > 10.0:
-                        participants_to_remove.append(participant_id)
-                    elif info.get('has_audio', False) and time_since_update > 2.0:
+                    # If participant hasn't been updated in 2 seconds, mark as not having audio
+                    if info.get('has_audio', False) and time_since_update > 2.0:
                         info['has_audio'] = False
                         info['db_level'] = INPUT_DB_MIN
-                
-                # Remove stale participants
-                for participant_id in participants_to_remove:
-                    del streamer.participants[participant_id]
                 
                 participants_list = list(streamer.participants.items())
             
@@ -867,19 +860,11 @@ class AudioStreamer:
         # Add participant meters (compact format)
         current_time = time.time()
         with self.participants_lock:
-            participants_to_remove = []
             for participant_id, info in list(self.participants.items()):
-                # More intelligent cleanup logic:
-                # - Remove participants who have been disconnected and haven't had audio for 2 seconds
-                # - Keep participants who are connected but not speaking (has_audio=False) for longer (10 seconds)
+                # Simple timeout logic to mark participants as not currently speaking
                 time_since_update = current_time - info['last_update']
-                
-                if not info.get('has_audio', False) and time_since_update > 10.0:
-                    # Participant hasn't had audio for 10 seconds, remove them
-                    participants_to_remove.append(participant_id)
-                    continue
-                elif info.get('has_audio', False) and time_since_update > 2.0:
-                    # Participant has audio but hasn't been updated recently, mark as no audio
+                # If participant hasn't been updated in 2 seconds, mark as not having audio
+                if info.get('has_audio', False) and time_since_update > 2.0:
                     info['has_audio'] = False
                     info['db_level'] = INPUT_DB_MIN
                 
@@ -898,12 +883,6 @@ class AudioStreamer:
                 
                 participant_part = f"{participant_indicator}{info['name'][:6]}[{info['db_level']:6.1f}]{_esc(participant_color_code)}[{participant_bar}]{_esc(0)}"
                 meter_parts.append(participant_part)
-            
-            # Remove stale participants
-            for participant_id in participants_to_remove:
-                removed_name = self.participants[participant_id]['name']
-                del self.participants[participant_id]
-                self.logger.debug(f"Removed stale participant from meter: {removed_name}")
         
         # Join status info at the beginning with all parts
         meter_text = status_info + " ".join(meter_parts)
@@ -1059,7 +1038,9 @@ async def main(participant_name: str, enable_aec: bool = True):
                                 streamer.participants[participant_id]['last_update'] = time.time()
                                 streamer.participants[participant_id]['has_audio'] = True
                             else:
-                                # Participant might have been added after track subscription
+                                # This shouldn't happen since participant should be added on track subscription
+                                # But handle gracefully just in case
+                                logger.warning(f"Received audio frame for untracked participant {participant_name}, adding to tracking")
                                 streamer.participants[participant_id] = {
                                     'name': participant_name,
                                     'db_level': participant_db,
@@ -1094,13 +1075,8 @@ async def main(participant_name: str, enable_aec: bool = True):
                 except Exception as e:
                     logger.warning(f"Error removing participant {participant_name} from mixer: {e}")
             
-            # Mark participant as not having audio when stream ends, but don't remove them
-            # They will be removed when they actually disconnect
-            with streamer.participants_lock:
-                if participant_id in streamer.participants:
-                    streamer.participants[participant_id]['has_audio'] = False
-                    streamer.participants[participant_id]['db_level'] = INPUT_DB_MIN
-                    logger.info(f"Marked participant {participant_name} as not having audio (stream ended)")
+            # Note: We no longer mark participants as not having audio when stream ends
+            # They will be removed from tracking when their audio track is unsubscribed/unpublished
 
     # Event handlers
     @room.on("track_subscribed")
@@ -1112,18 +1088,15 @@ async def main(participant_name: str, enable_aec: bool = True):
         logger.info("track subscribed: %s from participant %s (%s)", publication.sid, participant.sid, participant.identity)
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info(f"Starting audio stream for participant: {participant.identity}")
-            # Ensure participant is in our tracking when audio track starts
+            # Add participant to tracking when we subscribe to their audio track
             with streamer.participants_lock:
-                if participant.sid not in streamer.participants:
-                    streamer.participants[participant.sid] = {
-                        'name': participant.identity or f"User_{participant.sid[:8]}",
-                        'db_level': INPUT_DB_MIN,
-                        'last_update': time.time(),
-                        'has_audio': True
-                    }
-                else:
-                    # Update existing participant to indicate they now have audio
-                    streamer.participants[participant.sid]['has_audio'] = True
+                streamer.participants[participant.sid] = {
+                    'name': participant.identity or f"User_{participant.sid[:8]}",
+                    'db_level': INPUT_DB_MIN,
+                    'last_update': time.time(),
+                    'has_audio': True
+                }
+                logger.info(f"Added participant to tracking: {participant.identity or 'Unknown'}")
                     
             audio_stream = rtc.AudioStream(track, sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS)
             asyncio.ensure_future(receive_audio_frames(audio_stream, participant))
@@ -1135,24 +1108,23 @@ async def main(participant_name: str, enable_aec: bool = True):
         participant: rtc.RemoteParticipant,
     ):
         logger.info("track unsubscribed: %s from participant %s (%s)", publication.sid, participant.sid, participant.identity)
-        if track.kind == rtc.TrackKind.KIND_AUDIO:
-            logger.info(f"Audio track unsubscribed for participant: {participant.identity}")
             
-            # Remove participant stream from mixer if present
-            if participant.sid in streamer.participant_streams:
-                try:
-                    audio_gen = streamer.participant_streams[participant.sid]
-                    streamer.audio_mixer.remove_stream(audio_gen)
-                    del streamer.participant_streams[participant.sid]
-                    logger.info(f"Removed participant {participant.identity} from audio mixer due to track unsubscription")
-                except Exception as e:
-                    logger.warning(f"Error removing participant {participant.identity} from mixer on track unsubscription: {e}")
-            
-            # Mark participant as not having audio but keep them in tracking
-            with streamer.participants_lock:
-                if participant.sid in streamer.participants:
-                    streamer.participants[participant.sid]['has_audio'] = False
-                    streamer.participants[participant.sid]['db_level'] = INPUT_DB_MIN
+        # Remove participant stream from mixer if present
+        if participant.sid in streamer.participant_streams:
+            try:
+                audio_gen = streamer.participant_streams[participant.sid]
+                streamer.audio_mixer.remove_stream(audio_gen)
+                del streamer.participant_streams[participant.sid]
+                logger.info(f"Removed participant {participant.identity} from audio mixer due to track unsubscription")
+            except Exception as e:
+                logger.warning(f"Error removing participant {participant.identity} from mixer on track unsubscription: {e}")
+        
+        # Remove participant from tracking when we unsubscribe from their audio track
+        with streamer.participants_lock:
+            if participant.sid in streamer.participants:
+                participant_name = streamer.participants[participant.sid]['name']
+                del streamer.participants[participant.sid]
+                logger.info(f"Removed participant from tracking: {participant_name}")
 
     @room.on("track_published")
     def on_track_published(
@@ -1188,26 +1160,30 @@ async def main(participant_name: str, enable_aec: bool = True):
             logger.info(f"Unsubscribing from unpublished track: {publication.sid}")
             publication.set_subscribed(False)
         
-        # If this was an audio track, mark participant as not having audio
+        # If this was an audio track, remove participant from tracking
         if publication.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info(f"Audio track unpublished for participant: {participant.identity}")
+            
+            # Remove participant stream from mixer if present
+            if participant.sid in streamer.participant_streams:
+                try:
+                    audio_gen = streamer.participant_streams[participant.sid]
+                    streamer.audio_mixer.remove_stream(audio_gen)
+                    del streamer.participant_streams[participant.sid]
+                    logger.info(f"Removed participant {participant.identity} from audio mixer due to track unpublish")
+                except Exception as e:
+                    logger.warning(f"Error removing participant {participant.identity} from mixer on track unpublish: {e}")
+            
             with streamer.participants_lock:
                 if participant.sid in streamer.participants:
-                    streamer.participants[participant.sid]['has_audio'] = False
-                    streamer.participants[participant.sid]['db_level'] = INPUT_DB_MIN
+                    participant_name = streamer.participants[participant.sid]['name']
+                    del streamer.participants[participant.sid]
+                    logger.info(f"Removed participant from tracking due to audio track unpublish: {participant_name}")
 
     @room.on("participant_connected")
     def on_participant_connected(participant: rtc.RemoteParticipant):
         logger.info("participant connected: %s %s", participant.sid, participant.identity)
-        # Initialize participant in our tracking immediately when they connect
-        with streamer.participants_lock:
-            streamer.participants[participant.sid] = {
-                'name': participant.identity or f"User_{participant.sid[:8]}",
-                'db_level': INPUT_DB_MIN,
-                'last_update': time.time(),
-                'has_audio': False  # Will be set to True when audio track is subscribed
-            }
-        logger.info(f"Added participant to tracking: {participant.identity or 'Unknown'}")
+        # Note: We no longer track participants on connection - only when they publish audio tracks
 
     @room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
@@ -1229,14 +1205,8 @@ async def main(participant_name: str, enable_aec: bool = True):
             except Exception as e:
                 logger.warning(f"Error removing participant {participant.identity} from mixer on disconnect: {e}")
         
-        # Remove participant from our tracking immediately
-        with streamer.participants_lock:
-            if participant.sid in streamer.participants:
-                participant_name = streamer.participants[participant.sid]['name']
-                del streamer.participants[participant.sid]
-                logger.info(f"Removed participant from tracking: {participant_name}")
-            else:
-                logger.warning(f"Participant {participant.sid} not found in tracking when disconnecting")
+        # Note: We no longer remove participants from tracking on disconnect
+        # They will be removed when their audio tracks are unpublished
 
     @room.on("participant_name_changed")  
     def on_participant_name_changed(participant: rtc.RemoteParticipant):
