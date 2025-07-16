@@ -85,13 +85,23 @@ async def entrypoint(ctx: agents.JobContext):
         if participant.identity == "phone":
             room_io.set_participant(participant.identity)
             logging.info("phone connected, using 'phone' audio stream")
-
-    @ctx.room.on("participant_disconnected")
-    def on_participant_disconnected(participant: rtc.RemoteParticipant, fut=room_empty_future):
-        logging.info("participant disconnected: %s %s", participant.sid, participant.identity)
+    
+    @ctx.room.on("track_unpublished")
+    def on_track_unpublished(
+        publication: rtc.RemoteTrackPublication, participant: rtc.RemoteParticipant, fut=room_empty_future
+    ):
+        logging.info("track unpublished: %s from participant %s (%s)", publication.sid, participant.sid, participant.identity)
         if participant.identity == "phone":
             room_io.set_participant("robot")
             logging.info("phone disconnected, using 'robot' audio stream")
+       
+        
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(participant: rtc.RemoteParticipant, fut=room_empty_future):
+        logging.info("participant disconnected: %s %s", participant.sid, participant.identity)
+        # if participant.identity == "phone":
+        #     room_io.set_participant("robot")
+        #     logging.info("phone disconnected, using 'robot' audio stream")
         if len(ctx.room.remote_participants) == 0 and not fut.done():
             fut.set_result(None)  
             
