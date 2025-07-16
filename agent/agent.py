@@ -2,12 +2,16 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # dependencies = [
-#   "livekit-agents[deepgram,openai,cartesia,silero,elevenlabs,turn-detector,hume]~=1.0",
+#   "asyncio",
+#   "livekit==1.0.11",
+#   "livekit-agents==1.1.6",
+#   "livekit-agents[deepgram,openai,cartesia,silero,elevenlabs,turn-detector,hume]~=1.1.6",
 #   "livekit-plugins-noise-cancellation~=0.2",
 #   "python-dotenv",
 # ]
 # ///
 
+import asyncio
 import json
 import logging
 from dotenv import load_dotenv
@@ -57,19 +61,6 @@ async def entrypoint(ctx: agents.JobContext):
     room_io = RoomIO(session, room=ctx.room)
     await room_io.start()
     
-    @ctx.room.on("participant_connected")
-    def on_participant_connected(participant: rtc.RemoteParticipant) -> None:
-        logging.info("participant connected: %s %s", participant.sid, participant.identity)
-        if participant.identity == "phone":
-            room_io.set_participant(participant.identity)
-            logging.info("phone connected, using 'phone' audio stream")
-
-    @ctx.room.on("participant_disconnected")
-    def on_participant_disconnected(participant: rtc.RemoteParticipant):
-        logging.info("participant disconnected: %s %s", participant.sid, participant.identity)
-        if participant.identity == "phone":
-            room_io.set_participant("robot")
-            logging.info("phone disconnected, using 'robot' audio stream")
     
 
     await session.start(
@@ -81,6 +72,43 @@ async def entrypoint(ctx: agents.JobContext):
             close_on_disconnect=False,
         ),
     )
+    
+    # wait for either a participant to join or a shutdown signal
+    shutdown_future: asyncio.Future[None] = asyncio.Future()
+    
+    # wait for either last participant to leave or a shutdown signal
+    room_empty_future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    @ctx.room.on("participant_connected")
+    def on_participant_connected(participant: rtc.RemoteParticipant) -> None:
+        logging.info("participant connected: %s %s", participant.sid, participant.identity)
+        if participant.identity == "phone":
+            room_io.set_participant(participant.identity)
+            logging.info("phone connected, using 'phone' audio stream")
+
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(participant: rtc.RemoteParticipant, fut=room_empty_future):
+        logging.info("participant disconnected: %s %s", participant.sid, participant.identity)
+        if participant.identity == "phone":
+            room_io.set_participant("robot")
+            logging.info("phone disconnected, using 'robot' audio stream")
+        if len(ctx.room.remote_participants) == 0 and not fut.done():
+            fut.set_result(None)  
+            
+    # def _on_participant_disconnected(_: rtc.Participant, fut=room_empty_future) -> None:
+        
+
+    # ctx.room.on("participant_disconnected", _on_participant_disconnected)
+
+    try:
+        # blocking wait for either future to be set
+        await asyncio.wait(
+            [shutdown_future, room_empty_future], return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        # ctx.room.off("participant_disconnected", _on_participant_disconnected)
+        await session.aclose()
+
 
 
 if __name__ == "__main__":
