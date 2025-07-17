@@ -18,7 +18,6 @@ import threading
 import select
 import termios
 import tty
-import curses
 from dotenv import load_dotenv
 from signal import SIGINT, SIGTERM
 from livekit import rtc
@@ -27,6 +26,10 @@ import sounddevice as sd
 import numpy as np
 from auth import generate_token
 from list_devices import list_audio_devices
+from db_meter import (
+    normalize_db, calculate_db_from_samples, create_meter_ui,
+    INPUT_DB_MIN, INPUT_DB_MAX, FPS, SimpleTerminalMeter
+)
 
 load_dotenv()
 # ensure LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET are set in your .env file
@@ -38,290 +41,14 @@ NUM_CHANNELS = 1
 FRAME_SAMPLES = 480  # 10ms at 48kHz - required for APM
 BLOCKSIZE = 4800  # 100ms buffer
 
-# dB meter settings
-MAX_AUDIO_BAR = 20 # 20 chars wide
-INPUT_DB_MIN = -70.0
-INPUT_DB_MAX = 0.0
-FPS = 16
 
-def _esc(*codes: int) -> str:
-    return "\033[" + ";".join(str(c) for c in codes) + "m"
-
-def _normalize_db(amplitude_db: float, db_min: float, db_max: float) -> float:
-    amplitude_db = max(db_min, min(amplitude_db, db_max))
-    return (amplitude_db - db_min) / (db_max - db_min)
-
-class CursesUI:
-    """Full-screen ncurses UI for audio monitoring"""
-    
-    def __init__(self):
-        self.stdscr = None
-        self.running = True
-        self.selected_participant = 0
-        self.ui_lock = threading.Lock()
-        
-        # Colors
-        self.COLOR_LIVE = 1
-        self.COLOR_MUTED = 2
-        self.COLOR_PARTICIPANT = 3
-        self.COLOR_BORDER = 4
-        self.COLOR_METER_LOW = 5
-        self.COLOR_METER_MED = 6
-        self.COLOR_METER_HIGH = 7
-        
-    def init_curses(self):
-        """Initialize ncurses"""
-        self.stdscr = curses.initscr()
-        curses.noecho()
-        curses.cbreak()
-        self.stdscr.keypad(True)
-        self.stdscr.nodelay(True)
-        curses.curs_set(0)  # Hide cursor
-        
-        # Initialize colors
-        if curses.has_colors():
-            curses.start_color()
-            curses.init_pair(self.COLOR_LIVE, curses.COLOR_RED, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_MUTED, curses.COLOR_BLACK, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_PARTICIPANT, curses.COLOR_BLUE, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_BORDER, curses.COLOR_CYAN, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_METER_LOW, curses.COLOR_GREEN, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_METER_MED, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-            curses.init_pair(self.COLOR_METER_HIGH, curses.COLOR_RED, curses.COLOR_BLACK)
-    
-    def cleanup_curses(self):
-        """Cleanup ncurses"""
-        if self.stdscr:
-            curses.nocbreak()
-            self.stdscr.keypad(False)
-            curses.echo()
-            curses.endwin()
-    
-    def draw_box(self, y, x, height, width, title=""):
-        """Draw a box with optional title"""
-        # Draw box border
-        for i in range(height):
-            for j in range(width):
-                if i == 0 or i == height - 1:
-                    if j == 0:
-                        char = "┌" if i == 0 else "└"
-                    elif j == width - 1:
-                        char = "┐" if i == 0 else "┘"
-                    else:
-                        char = "─"
-                elif j == 0 or j == width - 1:
-                    char = "│"
-                else:
-                    continue
-                
-                try:
-                    self.stdscr.addstr(y + i, x + j, char, curses.color_pair(self.COLOR_BORDER))
-                except curses.error:
-                    pass
-        
-        # Add title
-        if title:
-            title_text = f"─ {title} "
-            remaining_width = max(0, width - len(title_text) - 2)
-            title_line = title_text + "─" * remaining_width
-            try:
-                self.stdscr.addstr(y, x + 1, title_line[:width-2], curses.color_pair(self.COLOR_BORDER))
-            except curses.error:
-                pass
-    
-    def draw_meter(self, y, x, width, level_db, max_width=40):
-        """Draw a dB meter bar"""
-        # Normalize dB level to 0-1 range
-        normalized = _normalize_db(level_db, db_min=INPUT_DB_MIN, db_max=INPUT_DB_MAX)
-        bar_width = min(max_width, width - 10)  # Leave space for dB value
-        filled_width = int(normalized * bar_width)
-        
-        # Choose color based on level
-        if normalized > 0.75:
-            color = curses.color_pair(self.COLOR_METER_HIGH)
-        elif normalized > 0.5:
-            color = curses.color_pair(self.COLOR_METER_MED)
-        else:
-            color = curses.color_pair(self.COLOR_METER_LOW)
-        
-        # Draw meter bar - use wider fixed width for dB display
-        meter_str = "█" * filled_width + "░" * (bar_width - filled_width)
-        db_str = f"[{level_db:6.1f}]"  # Changed from 5.1f to 6.1f for wider range
-        
-        try:
-            self.stdscr.addstr(y, x, db_str)
-            self.stdscr.addstr(y, x + 8, meter_str, color)
-        except curses.error:
-            pass
-    
-    def draw_interface(self, streamer):
-        """Draw the complete interface"""
-        with self.ui_lock:
-            if not self.stdscr:
-                return
-                
-            height, width = self.stdscr.getmaxyx()
-            self.stdscr.clear()
-            
-            current_y = 0
-            
-            # Local microphone section
-            box_height = 5
-            self.draw_box(current_y, 0, box_height, width, "Local Microphone")
-            
-            # Mute status indicator
-            with streamer.mute_lock:
-                is_muted = streamer.is_muted
-            
-            status_char = "●"
-            status_text = "MUTED" if is_muted else "LIVE"
-            status_color = curses.color_pair(self.COLOR_MUTED if is_muted else self.COLOR_LIVE)
-            
-            try:
-                self.stdscr.addstr(current_y + 1, 2, status_char, status_color)
-                self.stdscr.addstr(current_y + 1, 4, status_text, status_color)
-                self.stdscr.addstr(current_y + 1, 11, f"Mic ")
-            except curses.error:
-                pass
-            
-            # Local microphone meter
-            self.draw_meter(current_y + 1, 15, width - 17, streamer.micro_db)
-            
-            # Device info
-            try:
-                device_text = f"Device: {streamer.input_device_name}"
-                self.stdscr.addstr(current_y + 2, 2, device_text[:width-4])
-            except curses.error:
-                pass
-            
-            current_y += box_height + 1
-            
-            # Participants section
-            max_participants = min(10, height - current_y - 8)  # Leave space for stats and controls
-            participants_height = max_participants + 2
-            self.draw_box(current_y, 0, participants_height, width, "Remote Participants")
-            
-            # Draw participants 
-            participant_y = current_y + 1
-            current_time = time.time()
-            with streamer.participants_lock:
-                # Simple timeout logic to mark participants as not currently speaking
-                for participant_id, info in list(streamer.participants.items()):
-                    time_since_update = current_time - info['last_update']
-                    # If participant hasn't been updated in 2 seconds, mark as not having audio
-                    if info.get('has_audio', False) and time_since_update > 2.0:
-                        info['has_audio'] = False
-                        info['db_level'] = INPUT_DB_MIN
-                
-                participants_list = list(streamer.participants.items())
-            
-            if participants_list:
-                for i, (participant_id, info) in enumerate(participants_list[:max_participants]):
-                    if participant_y >= current_y + participants_height - 1:
-                        break
-                    
-                    # Participant indicator with audio status
-                    try:
-                        # Use different colors based on audio status
-                        if info.get('has_audio', False):
-                            # Active audio - bright blue
-                            indicator_color = curses.color_pair(self.COLOR_PARTICIPANT)
-                            status_char = "●"
-                        else:
-                            # No audio - dimmed
-                            indicator_color = curses.color_pair(self.COLOR_MUTED)
-                            status_char = "○"
-                        
-                        self.stdscr.addstr(participant_y, 2, status_char, indicator_color)
-                        
-                        # Participant name (truncated to fit)
-                        name = info['name'][:12]
-                        name_color = curses.color_pair(self.COLOR_PARTICIPANT) if info.get('has_audio', False) else curses.color_pair(self.COLOR_MUTED)
-                        self.stdscr.addstr(participant_y, 4, name, name_color)
-                        
-                        # Participant meter
-                        self.draw_meter(participant_y, 18, width - 20, info['db_level'])
-                        
-                    except curses.error:
-                        pass
-                    
-                    participant_y += 1
-            else:
-                try:
-                    self.stdscr.addstr(participant_y, 2, "No remote participants connected")
-                except curses.error:
-                    pass
-            
-            current_y += participants_height + 1
-            
-            # Statistics section
-            stats_height = 4
-            self.draw_box(current_y, 0, stats_height, width, "Statistics")
-            
-            try:
-                stats_line1 = f"Input Callbacks: {streamer.input_callback_count:>6}   Output Callbacks: {streamer.output_callback_count:>6}   Queue: {streamer.audio_input_queue.qsize():>3}"
-                stats_line2 = f"Frames Processed: {streamer.frames_processed:>5}  Frames Sent: {streamer.frames_sent_to_livekit:>5}        Participants: {len(participants_list):>2}"
-                stats_line3 = f"Mixer Frames: {streamer.mixer_frames_received:>5}     Audio Frames: {streamer.output_frames_with_audio:>5}        Mixer Streams: {len(streamer.participant_streams):>2}"
-                
-                self.stdscr.addstr(current_y + 1, 2, stats_line1[:width-4])
-                self.stdscr.addstr(current_y + 2, 2, stats_line2[:width-4])
-                try:
-                    self.stdscr.addstr(current_y + 3, 2, stats_line3[:width-4])
-                except curses.error:
-                    pass
-            except curses.error:
-                pass
-            
-            current_y += stats_height + 1
-            
-            # Controls section
-            controls_height = 3
-            self.draw_box(current_y, 0, controls_height, width, "Controls")
-            
-            try:
-                controls_text = "M - Toggle Mute    Q - Quit    ↑/↓ - Navigate    R - Refresh"
-                self.stdscr.addstr(current_y + 1, 2, controls_text[:width-4])
-            except curses.error:
-                pass
-            
-            self.stdscr.refresh()
-    
-    def handle_keyboard(self, streamer):
-        """Handle keyboard input in ncurses mode"""
-        if not self.stdscr:
-            return None
-            
-        try:
-            key = self.stdscr.getch()
-            if key == -1:  # No key pressed
-                return None
-            elif key == ord('q') or key == ord('Q'):
-                return 'quit'
-            elif key == ord('m') or key == ord('M'):
-                streamer.toggle_mute()
-                return 'mute_toggle'
-            elif key == ord('r') or key == ord('R'):
-                return 'refresh'
-            elif key == curses.KEY_UP:
-                self.selected_participant = max(0, self.selected_participant - 1)
-                return 'nav_up'
-            elif key == curses.KEY_DOWN:
-                with streamer.participants_lock:
-                    max_participants = len(streamer.participants)
-                self.selected_participant = min(max_participants - 1, self.selected_participant + 1)
-                return 'nav_down'
-        except curses.error:
-            pass
-        
-        return None
 
 class AudioStreamer:
-    def __init__(self, enable_aec: bool = True, loop: asyncio.AbstractEventLoop = None, use_curses: bool = False):
+    def __init__(self, enable_aec: bool = True, loop: asyncio.AbstractEventLoop = None):
         self.enable_aec = enable_aec
         self.running = True
         self.logger = logging.getLogger(__name__)
         self.loop = loop  # Store the event loop reference
-        self.use_curses = use_curses
         
         # Mute state
         self.is_muted = False
@@ -386,13 +113,8 @@ class AudioStreamer:
         self.meter_running = True
         self.keyboard_thread = None
         
-        # UI control - choose between curses and simple meter
-        if use_curses:
-            self.ui = CursesUI()
-        else:
-            self.ui = None
-            self.stdout_lock = threading.Lock()
-            self.meter_line_reserved = False
+        # UI control - create meter UI using factory function
+        self.ui = create_meter_ui()
         
     async def _run_mixer_task(self):
         """Process mixed audio from remote participants and send to output buffer"""
@@ -566,10 +288,6 @@ class AudioStreamer:
 
     def start_keyboard_handler(self):
         """Start keyboard input handler in a separate thread"""
-        if self.use_curses:
-            # Curses handles keyboard input in the UI update loop
-            return
-            
         def keyboard_handler():
             try:
                 # Save original terminal settings
@@ -697,9 +415,7 @@ class AudioStreamer:
                     # Only log this error for the first few frames to avoid spam
             
             # Calculate dB level for meter using original (unmuted) audio
-            rms = np.sqrt(np.mean(original_chunk.astype(np.float32) ** 2))
-            max_int16 = np.iinfo(np.int16).max
-            self.micro_db = 20.0 * np.log10(rms / max_int16 + 1e-6)
+            self.micro_db = calculate_db_from_samples(original_chunk)
             
             # Send to LiveKit using the stored event loop reference
             if self.loop and not self.loop.is_closed():
@@ -815,102 +531,22 @@ class AudioStreamer:
                     # Only log this error for the first few callbacks to avoid spam
     
     def print_audio_meter(self):
-        """Print dB meter with live/mute indicator - supports both curses and terminal modes"""
+        """Print dB meter with live/mute indicator - delegates to meter UI instance"""
         if not self.meter_running:
             return
             
-        if self.use_curses and self.ui:
-            # Use curses interface
-            self.ui.draw_interface(self)
-        else:
-            # Use simple terminal interface (original implementation)
-            self._print_simple_meter()
+        # Use simple terminal interface
+        self.ui.print_meter(self)
     
-    def _print_simple_meter(self):
-        """Original simple terminal meter display"""
-        if not self.meter_running:
-            return
-        
-        # Build a single compact line with all participants
-        meter_parts = []
-        
-        # Compact status info - moved to beginning of line
-        status_info = f"I:{self.input_callback_count} O:{self.output_callback_count} Q:{self.audio_input_queue.qsize()} P:{len(self.participants)} M:{self.mixer_frames_received} A:{self.output_frames_with_audio} "
-        
-        # Local microphone meter
-        amplitude_db = _normalize_db(self.micro_db, db_min=INPUT_DB_MIN, db_max=INPUT_DB_MAX)
-        nb_bar = round(amplitude_db * MAX_AUDIO_BAR)
-        
-        color_code = 31 if amplitude_db > 0.75 else 33 if amplitude_db > 0.5 else 32
-        bar = "#" * nb_bar + "-" * (MAX_AUDIO_BAR - nb_bar)
-        
-        # Add live/mute indicator
-        with self.mute_lock:
-            is_muted = self.is_muted
-        
-        if is_muted:
-            live_indicator = f"{_esc(90)}●{_esc(0)} "  # Gray dot
-        else:
-            live_indicator = f"{_esc(1, 38, 2, 255, 0, 0)}●{_esc(0)} "   # Bright red dot
-        
-        # Local mic part
-        local_part = f"{live_indicator}Mic[{self.micro_db:6.1f}]{_esc(color_code)}[{bar}]{_esc(0)}"
-        meter_parts.append(local_part)
-        
-        # Add participant meters (compact format)
-        current_time = time.time()
-        with self.participants_lock:
-            for participant_id, info in list(self.participants.items()):
-                # Simple timeout logic to mark participants as not currently speaking
-                time_since_update = current_time - info['last_update']
-                # If participant hasn't been updated in 2 seconds, mark as not having audio
-                if info.get('has_audio', False) and time_since_update > 2.0:
-                    info['has_audio'] = False
-                    info['db_level'] = INPUT_DB_MIN
-                
-                # Calculate participant meter
-                participant_amplitude_db = _normalize_db(info['db_level'], db_min=INPUT_DB_MIN, db_max=INPUT_DB_MAX)
-                participant_nb_bar = round(participant_amplitude_db * (MAX_AUDIO_BAR // 2))  # Smaller bars for participants
-                
-                participant_color_code = 31 if participant_amplitude_db > 0.75 else 33 if participant_amplitude_db > 0.5 else 32
-                participant_bar = "#" * participant_nb_bar + "-" * ((MAX_AUDIO_BAR // 2) - participant_nb_bar)
-                
-                # Use different indicator based on audio status
-                if info.get('has_audio', False):
-                    participant_indicator = f"{_esc(94)}●{_esc(0)} "  # Blue dot for participants with audio
-                else:
-                    participant_indicator = f"{_esc(90)}●{_esc(0)} "  # Gray dot for participants without audio
-                
-                participant_part = f"{participant_indicator}{info['name'][:6]}[{info['db_level']:6.1f}]{_esc(participant_color_code)}[{participant_bar}]{_esc(0)}"
-                meter_parts.append(participant_part)
-        
-        # Join status info at the beginning with all parts
-        meter_text = status_info + " ".join(meter_parts)
-        
-        with self.stdout_lock:
-            # Simple single-line update - clear line and rewrite
-            sys.stdout.write(f"\033[2K\r\033[?25l{meter_text}")
-            sys.stdout.flush()
+
 
     def init_terminal(self):
         """Initialize terminal for stable UI display"""
-        if self.use_curses and self.ui:
-            self.ui.init_curses()
-        else:
-            with self.stdout_lock:
-                # Hide cursor for cleaner display
-                sys.stdout.write("\033[?25l")
-                sys.stdout.flush()
+        pass
             
     def restore_terminal(self):
         """Restore terminal to normal state"""
-        if self.use_curses and self.ui:
-            self.ui.cleanup_curses()
-        else:
-            with self.stdout_lock:
-                # Clear the meter line and show cursor
-                sys.stdout.write("\033[2K\r\033[?25h")
-                sys.stdout.flush()
+        self.ui.cleanup()
 
 async def main(participant_name: str, enable_aec: bool = True):
     logger = logging.getLogger(__name__)
@@ -1027,9 +663,7 @@ async def main(participant_name: str, enable_aec: bool = True):
                     # Convert to numpy array for dB calculation
                     audio_samples = np.frombuffer(frame_data, dtype=np.int16)
                     if len(audio_samples) > 0:
-                        rms = np.sqrt(np.mean(audio_samples.astype(np.float32) ** 2))
-                        max_int16 = np.iinfo(np.int16).max
-                        participant_db = 20.0 * np.log10(rms / max_int16 + 1e-6)
+                        participant_db = calculate_db_from_samples(audio_samples)
                         
                         # Update participant info
                         with streamer.participants_lock:
