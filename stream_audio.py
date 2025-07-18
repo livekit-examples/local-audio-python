@@ -2,6 +2,7 @@
 # /// script
 # dependencies = [
 #   "livekit",
+#   "livekit-api",
 #   "sounddevice",
 #   "python-dotenv",
 #   "asyncio",
