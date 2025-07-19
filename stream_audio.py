@@ -59,7 +59,6 @@ class AudioStreamer:
         self.output_callback_count = 0
         self.frames_processed = 0
         self.frames_sent_to_livekit = 0
-        self.mixer_frames_received = 0
         self.output_frames_with_audio = 0
         self.last_debug_time = time.time()
         
@@ -70,16 +69,6 @@ class AudioStreamer:
         # LiveKit components
         self.source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
         self.room: rtc.Room | None = None
-        
-        # Audio mixer for combining remote participant audio
-        self.audio_mixer = rtc.AudioMixer(
-            SAMPLE_RATE, NUM_CHANNELS, 
-            blocksize=BLOCKSIZE, 
-            capacity=10,  # Support up to 10 participants
-            stream_timeout_ms=200
-        )
-        self.mixer_task: asyncio.Task | None = None
-        self.participant_streams = {}  # participant_id -> AsyncGenerator
         
         # Audio processing
         self.audio_processor: apm.AudioProcessingModule | None = None
@@ -115,56 +104,6 @@ class AudioStreamer:
         
         # UI control - create meter UI using factory function
         self.ui = create_meter_ui()
-        
-    async def _run_mixer_task(self):
-        """Process mixed audio from remote participants and send to output buffer"""
-        frames_mixed = 0
-        bytes_mixed = 0
-        self.logger.info("Audio mixer task started")
-        
-        try:
-            async for frame in self.audio_mixer:
-                if not self.running:
-                    break
-                    
-                frames_mixed += 1
-                if frames_mixed <= 5:
-                    self.logger.info(f"Mixed audio frame {frames_mixed}: {len(frame.data)} bytes, "
-                                   f"sample_rate={frame.sample_rate}, channels={frame.num_channels}, "
-                                   f"samples_per_channel={frame.samples_per_channel}")
-                elif frames_mixed % 100 == 0:
-                    self.logger.debug(f"Mixed {frames_mixed} frames total, {bytes_mixed} bytes total")
-                
-                # Verify frame format matches our expectations
-                if frame.sample_rate != SAMPLE_RATE:
-                    self.logger.warning(f"Mixed frame sample rate mismatch: {frame.sample_rate} vs {SAMPLE_RATE}")
-                if frame.num_channels != NUM_CHANNELS:
-                    self.logger.warning(f"Mixed frame channel count mismatch: {frame.num_channels} vs {NUM_CHANNELS}")
-                
-                # Add mixed audio to output buffer
-                audio_data = frame.data
-                if isinstance(audio_data, bytes):
-                    audio_bytes = audio_data
-                else:
-                    # Handle case where data might be in different format
-                    audio_bytes = bytes(audio_data)
-                
-                bytes_mixed += len(audio_bytes)
-                self.mixer_frames_received += 1
-                
-                with self.output_lock:
-                    self.output_buffer.extend(audio_bytes)
-                    
-                    # Log buffer size occasionally for debugging
-                    if frames_mixed <= 5 or frames_mixed % 100 == 0:
-                        self.logger.debug(f"Output buffer size after adding mixed frame: {len(self.output_buffer)} bytes")
-                    
-        except Exception as e:
-            self.logger.error(f"Error in mixer task: {e}")
-            import traceback
-            self.logger.error(f"Mixer task traceback: {traceback.format_exc()}")
-        finally:
-            self.logger.info(f"Audio mixer task ended. Total frames mixed: {frames_mixed}, total bytes: {bytes_mixed}")
 
     def start_audio_devices(self):
         """Initialize and start audio input/output devices"""
@@ -249,36 +188,7 @@ class AudioStreamer:
             
         self.logger.info("Audio devices stopped")
     
-    async def cleanup_mixer(self):
-        """Cleanup audio mixer and related components"""
-        self.logger.info("Cleaning up audio mixer...")
-        
-        # Cancel mixer task
-        if self.mixer_task and not self.mixer_task.done():
-            self.mixer_task.cancel()
-            try:
-                await self.mixer_task
-            except asyncio.CancelledError:
-                pass
-            self.mixer_task = None
-            
-        # Remove all participant streams from mixer
-        for participant_id, stream_gen in list(self.participant_streams.items()):
-            try:
-                self.audio_mixer.remove_stream(stream_gen)
-                await stream_gen.aclose()
-            except Exception as e:
-                self.logger.warning(f"Error closing stream for participant {participant_id}: {e}")
-        
-        self.participant_streams.clear()
-        
-        # Close the mixer
-        try:
-            await self.audio_mixer.aclose()
-        except Exception as e:
-            self.logger.warning(f"Error closing audio mixer: {e}")
-            
-        self.logger.info("Audio mixer cleanup complete")
+
     
     def toggle_mute(self):
         """Toggle microphone mute state"""
@@ -609,7 +519,7 @@ async def main(participant_name: str, enable_aec: bool = True):
             await asyncio.sleep(1 / FPS)
         logger.info("Meter task ended")
     
-    # Function to handle received audio frames using mixer
+    # Function to handle received audio frames and route directly to output
     async def receive_audio_frames(stream: rtc.AudioStream, participant: rtc.RemoteParticipant):
         frames_received = 0
         logger.info("Audio receive task started")
@@ -620,36 +530,8 @@ async def main(participant_name: str, enable_aec: bool = True):
         
         logger.info(f"Receiving audio from participant: {participant_name} ({participant_id})")
         
-        # Create a queue to pass frames from the stream to the mixer generator
-        frame_queue = asyncio.Queue(maxsize=100)
-        
-        async def participant_audio_generator():
-            """Generator that yields audio frames for this participant from the queue"""
-            try:
-                while streamer.running:
-                    try:
-                        frame = await asyncio.wait_for(frame_queue.get(), timeout=1.0)
-                        if frame is None:  # Sentinel value to stop
-                            break
-                        yield frame
-                    except asyncio.TimeoutError:
-                        continue
-                    except Exception as e:
-                        logger.error(f"Error in participant audio generator for {participant_name}: {e}")
-                        break
-            finally:
-                logger.info(f"Participant audio generator ended for {participant_name}")
-        
         try:
-            # Create and start the audio generator for this participant
-            audio_gen = participant_audio_generator()
-            
-            # Add the stream to the mixer
-            streamer.audio_mixer.add_stream(audio_gen)
-            streamer.participant_streams[participant_id] = audio_gen
-            logger.info(f"Added participant {participant_name} to audio mixer")
-            
-            # Process frames from the stream and send them to the generator via queue
+            # Process frames from the stream and send directly to output buffer
             async for frame_event in stream:
                 if not streamer.running:
                     break
@@ -660,10 +542,11 @@ async def main(participant_name: str, enable_aec: bool = True):
                 elif frames_received % 100 == 0:
                     logger.debug(f"Received {frames_received} frames total from {participant_name}")
                     
-                # Calculate dB level for this participant
+                # Get audio frame data
                 frame_data = frame_event.frame.data
                 if len(frame_data) > 0:
-                    # Convert to numpy array for dB calculation
+                    # Convert to numpy array for dB calculat
+                    # ion
                     audio_samples = np.frombuffer(frame_data, dtype=np.int16)
                     if len(audio_samples) > 0:
                         participant_db = calculate_db_from_samples(audio_samples)
@@ -685,35 +568,20 @@ async def main(participant_name: str, enable_aec: bool = True):
                                     'has_audio': True
                                 }
                     
-                # Send frame to the mixer generator via queue
-                try:
-                    frame_queue.put_nowait(frame_event.frame)
-                except asyncio.QueueFull:
-                    logger.warning(f"Frame queue full for participant {participant_name}, dropping frame")
+                    # Send audio data directly to output buffer
+                    audio_bytes = frame_data if isinstance(frame_data, bytes) else bytes(frame_data)
+                    
+                    with streamer.output_lock:
+                        streamer.output_buffer.extend(audio_bytes)
+                        
+                        # Log buffer size occasionally for debugging
+                        if frames_received <= 5 or frames_received % 100 == 0:
+                            logger.debug(f"Output buffer size after adding frame: {len(streamer.output_buffer)} bytes")
                 
         except Exception as e:
             logger.error(f"Error in receive_audio_frames for {participant_name}: {e}")
         finally:
             logger.info(f"Audio receive task ended for {participant_name}. Total frames received: {frames_received}")
-            
-            # Signal the generator to stop
-            try:
-                frame_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
-            
-            # Remove from mixer and clean up
-            if participant_id in streamer.participant_streams:
-                try:
-                    audio_gen = streamer.participant_streams[participant_id]
-                    streamer.audio_mixer.remove_stream(audio_gen)
-                    del streamer.participant_streams[participant_id]
-                    logger.info(f"Removed participant {participant_name} from audio mixer")
-                except Exception as e:
-                    logger.warning(f"Error removing participant {participant_name} from mixer: {e}")
-            
-            # Note: We no longer mark participants as not having audio when stream ends
-            # They will be removed from tracking when their audio track is unsubscribed/unpublished
 
     # Event handlers
     @room.on("track_subscribed")
@@ -745,16 +613,6 @@ async def main(participant_name: str, enable_aec: bool = True):
         participant: rtc.RemoteParticipant,
     ):
         logger.info("track unsubscribed: %s from participant %s (%s)", publication.sid, participant.sid, participant.identity)
-            
-        # Remove participant stream from mixer if present
-        if participant.sid in streamer.participant_streams:
-            try:
-                audio_gen = streamer.participant_streams[participant.sid]
-                streamer.audio_mixer.remove_stream(audio_gen)
-                del streamer.participant_streams[participant.sid]
-                logger.info(f"Removed participant {participant.identity} from audio mixer due to track unsubscription")
-            except Exception as e:
-                logger.warning(f"Error removing participant {participant.identity} from mixer on track unsubscription: {e}")
         
         # Remove participant from tracking when we unsubscribe from their audio track
         with streamer.participants_lock:
@@ -801,16 +659,6 @@ async def main(participant_name: str, enable_aec: bool = True):
         if publication.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info(f"Audio track unpublished for participant: {participant.identity}")
             
-            # Remove participant stream from mixer if present
-            if participant.sid in streamer.participant_streams:
-                try:
-                    audio_gen = streamer.participant_streams[participant.sid]
-                    streamer.audio_mixer.remove_stream(audio_gen)
-                    del streamer.participant_streams[participant.sid]
-                    logger.info(f"Removed participant {participant.identity} from audio mixer due to track unpublish")
-                except Exception as e:
-                    logger.warning(f"Error removing participant {participant.identity} from mixer on track unpublish: {e}")
-            
             with streamer.participants_lock:
                 if participant.sid in streamer.participants:
                     participant_name = streamer.participants[participant.sid]['name']
@@ -831,16 +679,6 @@ async def main(participant_name: str, enable_aec: bool = True):
             if isinstance(publication, rtc.RemoteTrackPublication) and publication.subscribed:
                 logger.info(f"Unsubscribing from track {publication.sid} due to participant disconnect")
                 publication.set_subscribed(False)
-        
-        # Remove participant stream from mixer if present
-        if participant.sid in streamer.participant_streams:
-            try:
-                audio_gen = streamer.participant_streams[participant.sid]
-                streamer.audio_mixer.remove_stream(audio_gen)
-                del streamer.participant_streams[participant.sid]
-                logger.info(f"Removed participant {participant.identity} from audio mixer due to disconnect")
-            except Exception as e:
-                logger.warning(f"Error removing participant {participant.identity} from mixer on disconnect: {e}")
         
         # Note: We no longer remove participants from tracking on disconnect
         # They will be removed when their audio tracks are unpublished
@@ -918,10 +756,6 @@ async def main(participant_name: str, enable_aec: bool = True):
         audio_task = asyncio.create_task(audio_processing_task())
         meter_display_task = asyncio.create_task(meter_task())
         
-        # Start mixer task to handle audio from remote participants
-        logger.info("Starting audio mixer task...")
-        streamer.mixer_task = asyncio.create_task(streamer._run_mixer_task())
-        
         logger.info("=== Audio streaming started. Press Ctrl+C to stop. ===")
         
         # Keep running until interrupted
@@ -953,9 +787,6 @@ async def main(participant_name: str, enable_aec: bool = True):
                 await meter_display_task
             except asyncio.CancelledError:
                 pass
-        
-        # Cleanup audio mixer
-        await streamer.cleanup_mixer()
         
         streamer.stop_audio_devices()
         streamer.stop_keyboard_handler()

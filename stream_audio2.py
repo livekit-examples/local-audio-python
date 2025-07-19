@@ -292,12 +292,13 @@ class CursesUI:
         return None
 
 class AudioStreamer:
-    def __init__(self, enable_aec: bool = True, loop: asyncio.AbstractEventLoop = None, use_curses: bool = False):
+    def __init__(self, enable_aec: bool = True, loop: asyncio.AbstractEventLoop = None, use_curses: bool = False, volume: float = 1.0):
         self.enable_aec = enable_aec
         self.running = True
         self.logger = logging.getLogger(__name__)
         self.loop = loop  # Store the event loop reference
         self.use_curses = use_curses
+        self.volume = max(0.0, min(1.0, volume))  # Clamp volume to 0.0-1.0 range
         
         # Mute state
         self.is_muted = False
@@ -653,6 +654,10 @@ class AudioStreamer:
                 outdata[:, 0] = np.frombuffer(chunk, dtype=np.int16, count=frame_count)
                 del self.output_buffer[:bytes_needed]
         
+        # Apply volume scaling to the output audio
+        if self.volume != 1.0:
+            outdata[:, 0] = (outdata[:, 0].astype(np.float32) * self.volume).astype(np.int16)
+        
         # Process output through AEC reverse stream
         if self.audio_processor:
             num_chunks = frame_count // FRAME_SAMPLES
@@ -769,7 +774,7 @@ class AudioStreamer:
                 sys.stdout.write("\033[2K\r\033[?25h")
                 sys.stdout.flush()
 
-async def main(participant_name: str, enable_aec: bool = True):
+async def main(participant_name: str, enable_aec: bool = True, volume: float = 1.0):
     logger = logging.getLogger(__name__)
     logger.info("=== STARTING AUDIO STREAMER ===")
     
@@ -785,7 +790,7 @@ async def main(participant_name: str, enable_aec: bool = True):
         return
     
     # Create audio streamer with loop reference
-    streamer = AudioStreamer(enable_aec, loop=loop)
+    streamer = AudioStreamer(enable_aec, loop=loop, volume=volume)
     
     # Create room
     room = rtc.Room(loop=loop)
@@ -961,6 +966,8 @@ async def main(participant_name: str, enable_aec: bool = True):
         else:
             logger.info("Echo cancellation is disabled")
         
+        logger.info(f"Output volume set to: {volume:.1f}")
+        
         # Start background tasks
         logger.info("Starting background tasks...")
         audio_task = asyncio.create_task(audio_processing_task())
@@ -1026,7 +1033,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable debug logging"
     )
+    parser.add_argument(
+        "--volume",
+        "-v",
+        type=float,
+        default=1.0,
+        help="Output volume (0.0 to 1.0, default: 1.0)"
+    )
     args = parser.parse_args()
+    
+    # Validate volume range
+    if not (0.0 <= args.volume <= 1.0):
+        parser.error("Volume must be between 0.0 and 1.0")
     
     # Set up logging
     log_level = logging.DEBUG if args.debug else logging.INFO
@@ -1064,7 +1082,7 @@ if __name__ == "__main__":
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        main_task = asyncio.ensure_future(main(args.name, enable_aec=not args.disable_aec))
+        main_task = asyncio.ensure_future(main(args.name, enable_aec=not args.disable_aec, volume=args.volume))
         for signal in [SIGINT, SIGTERM]:
             loop.add_signal_handler(signal, signal_handler)
 
