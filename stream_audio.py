@@ -178,7 +178,8 @@ class AudioStreamer:
             input_device, output_device = sd.default.device
             
             # Override to use DC Microphone (device 1) which is working
-            #input_device = 1  # DC Microphone
+            input_device = 2  # DC Microphone
+            output_device = 1
             
             self.logger.info(f"Using input device: {input_device}, output device: {output_device}")
             
@@ -198,7 +199,7 @@ class AudioStreamer:
             self.input_stream = sd.InputStream(
                 callback=self._input_callback,
                 dtype="int16",
-                channels=NUM_CHANNELS,
+                channels=6, #NUM_CHANNELS,
                 device=input_device,
                 samplerate=SAMPLE_RATE,
                 blocksize=BLOCKSIZE,
@@ -328,6 +329,8 @@ class AudioStreamer:
     def _input_callback(self, indata: np.ndarray, frame_count: int, time_info, status) -> None:
         """Sounddevice input callback - processes microphone audio"""
         self.input_callback_count += 1
+        
+        indata = indata[:, 3].reshape(-1, 1)
         
         # Debug logging every few seconds
         current_time = time.time()
