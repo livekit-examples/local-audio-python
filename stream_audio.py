@@ -2,6 +2,7 @@
 # /// script
 # dependencies = [
 #   "livekit",
+#   "livekit-api",
 #   "sounddevice",
 #   "python-dotenv",
 #   "asyncio",
@@ -36,7 +37,7 @@ ROOM_NAME = os.environ.get("ROOM_NAME")
 SAMPLE_RATE = 48000  # 48kHz to match DC Microphone native rate
 NUM_CHANNELS = 1
 FRAME_SAMPLES = 480  # 10ms at 48kHz - required for APM
-BLOCKSIZE = 4800  # 100ms buffer
+BLOCKSIZE = 480  # 10ms buffer - matches FRAME_SAMPLES for minimal latency
 
 # dB meter settings
 MAX_AUDIO_BAR = 20 # 20 chars wide
@@ -323,12 +324,13 @@ class CursesUI:
         return None
 
 class AudioStreamer:
-    def __init__(self, enable_aec: bool = True, loop: asyncio.AbstractEventLoop = None, use_curses: bool = False):
+    def __init__(self, enable_aec: bool = True, loop: asyncio.AbstractEventLoop = None, use_curses: bool = False, volume: float = 1.0):
         self.enable_aec = enable_aec
         self.running = True
         self.logger = logging.getLogger(__name__)
         self.loop = loop  # Store the event loop reference
         self.use_curses = use_curses
+        self.volume = max(0.0, min(1.0, volume))  # Clamp volume to 0.0-1.0 range
         
         # Mute state
         self.is_muted = False
@@ -375,7 +377,7 @@ class AudioStreamer:
         # Audio buffers and synchronization
         self.output_buffer = bytearray()
         self.output_lock = threading.Lock()
-        self.audio_input_queue = asyncio.Queue(maxsize=100)  # Prevent memory buildup
+        self.audio_input_queue = asyncio.Queue(maxsize=20)  # Balanced for low latency with stability
         
         # Timing and delay tracking for AEC
         self.output_delay = 0.0
@@ -464,6 +466,8 @@ class AudioStreamer:
             
             # Override to use DC Microphone (device 1) which is working
             #input_device = 1  # DC Microphone
+            # input_device = 2  # DC Microphone
+            # output_device = 1
             
             self.logger.info(f"Using input device: {input_device}, output device: {output_device}")
             
@@ -618,6 +622,8 @@ class AudioStreamer:
         """Sounddevice input callback - processes microphone audio"""
         self.input_callback_count += 1
         
+        # indata = indata[:, 3].reshape(-1, 1)
+        
         # Debug logging every few seconds
         current_time = time.time()
         if current_time - self.last_debug_time > 5.0:
@@ -665,21 +671,14 @@ class AudioStreamer:
                     self.logger.warning("Continuing without delay compensation - audio quality may be affected")
                     self._delay_error_logged = True
         
-        # Process audio in 10ms frames for AEC
-        num_frames = frame_count // FRAME_SAMPLES
-        
-        if self.input_callback_count <= 3:
-            self.logger.info(f"Processing {num_frames} frames of {FRAME_SAMPLES} samples each")
-        
-        for i in range(num_frames):
-            start = i * FRAME_SAMPLES
-            end = start + FRAME_SAMPLES
-            if end > frame_count:
-                break
-                
+        # Since BLOCKSIZE now matches FRAME_SAMPLES, process single frame directly
+        if frame_count == FRAME_SAMPLES:
+            if self.input_callback_count <= 3:
+                self.logger.info(f"Processing single frame of {FRAME_SAMPLES} samples")
+            
             # Use original data for meter calculation, processed data for transmission
-            original_chunk = indata[start:end, 0]  # For meter calculation
-            capture_chunk = processed_indata[start:end, 0]  # For transmission (may be muted)
+            original_chunk = indata[:, 0]  # For meter calculation
+            capture_chunk = processed_indata[:, 0]  # For transmission (may be muted)
             
             # Create audio frame for AEC processing
             capture_frame = rtc.AudioFrame(
@@ -713,25 +712,31 @@ class AudioStreamer:
                 try:
                     # Check queue size
                     queue_size = self.audio_input_queue.qsize()
-                    if queue_size > 50:
+                    if queue_size > 15:
                         self.logger.warning(f"Audio input queue getting full: {queue_size} items")
                     
                     # Use the stored loop reference instead of trying to get current loop
-                    self.loop.call_soon_threadsafe(
-                        self.audio_input_queue.put_nowait, capture_frame
-                    )
-                    self.frames_sent_to_livekit += 1
-                    
-                    if self.frames_sent_to_livekit <= 5:
-                        self.logger.info(f"Sent frame {self.frames_sent_to_livekit} to LiveKit queue")
+                    try:
+                        self.audio_input_queue.put_nowait(capture_frame)
+                        self.frames_sent_to_livekit += 1
+                        
+                        if self.frames_sent_to_livekit <= 5:
+                            self.logger.info(f"Sent frame {self.frames_sent_to_livekit} to LiveKit queue")
+                    except asyncio.QueueFull:
+                        # Drop frame if queue is full to prevent blocking audio callback
+                        if self.frames_processed % 100 == 0:  # Log occasionally
+                            self.logger.warning(f"Dropped audio frame - queue full (size: {queue_size})")
                         
                 except Exception as e:
-                    # Queue might be full or event loop might be closed
+                    # Other errors (event loop closed, etc.)
                     if self.frames_processed <= 10:
                         self.logger.warning(f"Failed to queue audio frame: {e}")
             else:
                 if self.frames_processed <= 5:
                     self.logger.error("No valid event loop available for queuing audio frame")
+        else:
+            # Fallback for mismatched frame sizes (shouldn't happen with current settings)
+            self.logger.warning(f"Frame count {frame_count} doesn't match expected {FRAME_SAMPLES}, skipping frame")
     
     def _output_callback(self, outdata: np.ndarray, frame_count: int, time_info, status) -> None:
         """Sounddevice output callback - plays received audio"""
@@ -796,6 +801,10 @@ class AudioStreamer:
                 if self.output_callback_count <= 5 or self.output_callback_count % 100 == 0:
                     audio_rms = np.sqrt(np.mean(outdata[:, 0].astype(np.float32) ** 2))
                     self.logger.debug(f"Output audio level - max: {audio_level}, rms: {audio_rms:.2f}")
+        
+        # Apply volume scaling to the output audio
+        if self.volume != 1.0:
+            outdata[:, 0] = (outdata[:, 0].astype(np.float32) * self.volume).astype(np.int16)
         
         # Process output through AEC reverse stream
         if self.audio_processor:
@@ -933,7 +942,7 @@ class AudioStreamer:
                 sys.stdout.write("\033[2K\r\033[?25h")
                 sys.stdout.flush()
 
-async def main(participant_name: str, enable_aec: bool = True):
+async def main(participant_name: str, enable_aec: bool = True, volume: float = 1.0):
     logger = logging.getLogger(__name__)
     logger.info("=== STARTING AUDIO STREAMER ===")
     
@@ -949,7 +958,7 @@ async def main(participant_name: str, enable_aec: bool = True):
         return
     
     # Create audio streamer with loop reference
-    streamer = AudioStreamer(enable_aec, loop=loop)
+    streamer = AudioStreamer(enable_aec, loop=loop, volume=volume)
     
     # Create room
     room = rtc.Room(loop=loop)
@@ -963,8 +972,8 @@ async def main(participant_name: str, enable_aec: bool = True):
         
         while streamer.running:
             try:
-                # Get audio frame from input callback
-                frame = await asyncio.wait_for(streamer.audio_input_queue.get(), timeout=1.0)
+                # Get audio frame from input callback (no timeout for faster processing)
+                frame = await streamer.audio_input_queue.get()
                 await streamer.source.capture_frame(frame)
                 frames_sent += 1
                 
@@ -973,9 +982,6 @@ async def main(participant_name: str, enable_aec: bool = True):
                 elif frames_sent % 100 == 0:
                     logger.info(f"Sent {frames_sent} frames total to LiveKit")
                     
-            except asyncio.TimeoutError:
-                logger.debug("No audio frames in queue (timeout)")
-                continue
             except Exception as e:
                 logger.error(f"Error in audio processing: {e}")
                 break
@@ -1306,6 +1312,8 @@ async def main(participant_name: str, enable_aec: bool = True):
         else:
             logger.info("Echo cancellation is disabled")
         
+        logger.info(f"Output volume set to: {volume:.1f}")
+        
         # Start background tasks
         logger.info("Starting background tasks...")
         audio_task = asyncio.create_task(audio_processing_task())
@@ -1378,7 +1386,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable debug logging"
     )
+    parser.add_argument(
+        "--volume",
+        "-v",
+        type=float,
+        default=1.0,
+        help="Output volume (0.0 to 1.0, default: 1.0)"
+    )
     args = parser.parse_args()
+    
+    # Validate volume range
+    if not (0.0 <= args.volume <= 1.0):
+        parser.error("Volume must be between 0.0 and 1.0")
     
     # Set up logging
     log_level = logging.DEBUG if args.debug else logging.INFO
@@ -1416,7 +1435,7 @@ if __name__ == "__main__":
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        main_task = asyncio.ensure_future(main(args.name, enable_aec=not args.disable_aec))
+        main_task = asyncio.ensure_future(main(args.name, enable_aec=not args.disable_aec, volume=args.volume))
         for signal in [SIGINT, SIGTERM]:
             loop.add_signal_handler(signal, signal_handler)
 
