@@ -18,15 +18,18 @@ import threading
 import select
 import termios
 import tty
+import json
+from typing import Dict, Any
 
 from dotenv import load_dotenv
 from signal import SIGINT, SIGTERM
 from livekit import rtc
-from livekit.rtc import apm
+from livekit.rtc import apm, RpcInvocationData
 import sounddevice as sd
 import numpy as np
 from auth import generate_token
 from list_devices import list_audio_devices
+from task.task_handler import get_task_handler
 
 load_dotenv()
 # ensure LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET are set in your .env file
@@ -54,9 +57,10 @@ def _normalize_db(amplitude_db: float, db_min: float, db_max: float) -> float:
 
 
 class AudioStreamer:
-    def __init__(self, enable_aec: bool = True, loop: asyncio.AbstractEventLoop = None):
+    def __init__(self, enable_aec: bool = True, loop: asyncio.AbstractEventLoop = None, debug: bool = False):
         self.enable_aec = enable_aec
         self.running = True
+        self.debug = debug
         self.logger = logging.getLogger(__name__)
         self.loop = loop  # Store the event loop reference
         
@@ -108,7 +112,7 @@ class AudioStreamer:
         self.participants_lock = threading.Lock()
         
         # Control flags
-        self.meter_running = True
+        self.meter_running = not debug  # Disable meter when in debug mode
         self.keyboard_thread = None
         
         # UI control - simple terminal meter only
@@ -249,11 +253,11 @@ class AudioStreamer:
         
         # Debug logging every few seconds
         current_time = time.time()
-        if current_time - self.last_debug_time > 5.0:
-            self.logger.info(f"Input callback stats: called {self.input_callback_count} times, "
-                           f"processed {self.frames_processed} frames, "
-                           f"sent {self.frames_sent_to_livekit} to LiveKit")
-            self.last_debug_time = current_time
+        # if current_time - self.last_debug_time > 5.0:
+        #     self.logger.info(f"Input callback stats: called {self.input_callback_count} times, "
+        #                    f"processed {self.frames_processed} frames, "
+        #                    f"sent {self.frames_sent_to_livekit} to LiveKit")
+        #     self.last_debug_time = current_time
         
         if status:
             self.logger.warning(f"Input callback status: {status}")
@@ -509,7 +513,7 @@ class AudioStreamer:
             sys.stdout.write("\033[2K\r\033[?25h")
             sys.stdout.flush()
 
-async def main(participant_name: str, enable_aec: bool = True):
+async def main(participant_name: str, enable_aec: bool = True, debug: bool = False):
     logger = logging.getLogger(__name__)
     logger.info("=== STARTING AUDIO STREAMER ===")
     
@@ -525,7 +529,7 @@ async def main(participant_name: str, enable_aec: bool = True):
         return
     
     # Create audio streamer with loop reference
-    streamer = AudioStreamer(enable_aec, loop=loop)
+    streamer = AudioStreamer(enable_aec, loop=loop, debug=debug)
     
     # Create room
     room = rtc.Room(loop=loop)
@@ -546,8 +550,6 @@ async def main(participant_name: str, enable_aec: bool = True):
                 
                 if frames_sent <= 5:
                     logger.info(f"Sent frame {frames_sent} to LiveKit source")
-                elif frames_sent % 100 == 0:
-                    logger.info(f"Sent {frames_sent} frames total to LiveKit")
                     
             except asyncio.TimeoutError:
                 logger.debug("No audio frames in queue (timeout)")
@@ -561,6 +563,9 @@ async def main(participant_name: str, enable_aec: bool = True):
     # Meter display task
     async def meter_task():
         """Display audio level meter"""
+        if streamer.debug:
+            logger.info("Meter task disabled in debug mode")
+            return
         logger.info("Meter task started")
         while streamer.running and streamer.meter_running:
             streamer.print_audio_meter()
@@ -585,8 +590,8 @@ async def main(participant_name: str, enable_aec: bool = True):
             frames_received += 1
             if frames_received <= 5:
                 logger.info(f"Received audio frame {frames_received} from {participant_name}")
-            elif frames_received % 100 == 0:
-                logger.info(f"Received {frames_received} frames total from {participant_name}")
+            # elif frames_received % 100 == 0:
+            #     logger.info(f"Received {frames_received} frames total from {participant_name}")
                 
             # Calculate dB level for this participant
             frame_data = frame_event.frame.data
@@ -670,6 +675,7 @@ async def main(participant_name: str, enable_aec: bool = True):
     @room.on("disconnected")
     def on_disconnected(reason):
         logger.info(f"Disconnected from LiveKit room: {reason}")
+        
 
     try:
         # Start audio devices
@@ -677,11 +683,13 @@ async def main(participant_name: str, enable_aec: bool = True):
         streamer.start_audio_devices()
         
         # Start keyboard handler
-        logger.info("Starting keyboard handler...")
-        streamer.start_keyboard_handler()
+        if not debug:
+            logger.info("Starting keyboard handler...")
+            streamer.start_keyboard_handler()
         
-        # Initialize terminal for stable UI
-        streamer.init_terminal()
+        # Initialize terminal for stable UI (skip in debug mode)
+        if not debug:
+            streamer.init_terminal()
         
         # Connect to LiveKit room
         logger.info("Connecting to LiveKit room...")
@@ -690,6 +698,74 @@ async def main(participant_name: str, enable_aec: bool = True):
         
         await room.connect(LIVEKIT_URL, token)
         logger.info("connected to room %s", room.name)
+        
+        # Create callback function for task completion
+        async def on_task_complete(task_info: Dict[str, Any]):
+            """Callback function to notify agent when task completes"""
+            try:
+                # Format the completion message
+                if task_info["status"] == "completed":
+                    message = f"Task '{task_info['task_name']}' completed successfully after {task_info['duration']:.1f} seconds."
+                elif task_info["status"] == "error":
+                    message = f"Task '{task_info['task_name']}' failed: {task_info.get('error_message', 'Unknown error')}"
+                else:
+                    message = f"Task '{task_info['task_name']}' finished with status: {task_info['status']}"
+                
+                logger.info(f"Sending task completion to agent: {message}")
+                
+                # publish data 
+                await room.local_participant.publish_data(
+                    message,
+                    topic = "task_completed"
+                )
+                
+            except Exception as e:
+                logger.error(f"Error notifying agent of task completion: {e}")
+        
+        # Get task handler instance with completion callback
+        task_handler = get_task_handler(on_complete=on_task_complete)
+        
+        # Register RPC methods
+        @room.local_participant.register_rpc_method("start_task")
+        async def start_task_rpc(data: RpcInvocationData):
+            """RPC method to start a new task"""
+            try:
+                task_name = data.payload
+                logger.info(f"Received start_task RPC from {data.caller_identity}: {task_name}")
+                
+                # Start the task using the task handler
+                result = await task_handler.start_task(task_name)
+                
+                if (result["success"]):
+                    logger.info(f"Task start result: {result}")
+                    return f"Task started successfully: {task_name}"
+                else:
+                    logger.error(f"Task start result: {result}")
+                    return f"Failed to start task {task_name}, {result['error']}"
+                
+            except Exception as e:
+                error_msg = f"Error in start_task RPC: {str(e)}"
+                logger.error(error_msg)
+                return f"Failed to start task {task_name}, {str(e)}"
+        
+        @room.local_participant.register_rpc_method("get_current_task")
+        async def get_current_task_rpc(data: RpcInvocationData):
+            """RPC method to get current task status"""
+            try:
+                logger.info(f"Received get_current_task RPC from {data.caller_identity}")
+                
+                # Get current task status
+                current_task = await task_handler.get_current_task()
+                
+                if (current_task == None):
+                    return "No task is running"
+                else:
+                    return f"Current task: {current_task['task_name']}, progress: {current_task['progress']}"
+                
+            except Exception as e:
+                error_msg = f"Error in get_current_task RPC: {str(e)}"
+                logger.error(error_msg)
+                return "error getting current task"
         
         # Publish microphone track
         logger.info("Publishing microphone track...")
@@ -743,10 +819,16 @@ async def main(participant_name: str, enable_aec: bool = True):
         
         streamer.stop_audio_devices()
         streamer.stop_keyboard_handler()
+        
+        # Cleanup task handler
+        if 'task_handler' in locals():
+            await task_handler.cleanup()
+        
         await room.disconnect()
         
-        # Clear the meter line
-        streamer.restore_terminal()
+        # Clear the meter line (skip in debug mode)
+        if not debug:
+            streamer.restore_terminal()
         logger.info("=== CLEANUP COMPLETE ===")
 
 if __name__ == "__main__":
@@ -807,7 +889,7 @@ if __name__ == "__main__":
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        main_task = asyncio.ensure_future(main(args.name, enable_aec=not args.disable_aec))
+        main_task = asyncio.ensure_future(main(args.name, enable_aec=not args.disable_aec, debug=args.debug))
         for signal in [SIGINT, SIGTERM]:
             loop.add_signal_handler(signal, signal_handler)
 
