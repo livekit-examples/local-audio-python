@@ -114,6 +114,10 @@ class AudioStreamer:
         # UI control - simple terminal meter only
         self.stdout_lock = threading.Lock()
         self.meter_line_reserved = False
+
+        # Remote playback control: only play first subscribed remote audio track
+        self.active_remote_participant_id: str | None = None
+        self.remote_playback_enabled = True
         
     def start_audio_devices(self):
         """Initialize and start audio input/output devices"""
@@ -588,28 +592,30 @@ async def main(participant_name: str, enable_aec: bool = True):
             elif frames_received % 100 == 0:
                 logger.info(f"Received {frames_received} frames total from {participant_name}")
                 
-            # Calculate dB level for this participant
-            frame_data = frame_event.frame.data
-            if len(frame_data) > 0:
-                # Convert to numpy array for dB calculation
-                audio_samples = np.frombuffer(frame_data, dtype=np.int16)
-                if len(audio_samples) > 0:
-                    rms = np.sqrt(np.mean(audio_samples.astype(np.float32) ** 2))
-                    max_int16 = np.iinfo(np.int16).max
-                    participant_db = 20.0 * np.log10(rms / max_int16 + 1e-6)
-                    
-                    # Update participant info
-                    with streamer.participants_lock:
-                        streamer.participants[participant_id] = {
-                            'name': participant_name,
-                            'db_level': participant_db,
-                            'last_update': time.time()
-                        }
+            # Only process/play audio if this participant is the active remote track
+            if streamer.active_remote_participant_id == participant_id and streamer.remote_playback_enabled:
+                # Calculate dB level for this participant
+                frame_data = frame_event.frame.data
+                if len(frame_data) > 0:
+                    # Convert to numpy array for dB calculation
+                    audio_samples = np.frombuffer(frame_data, dtype=np.int16)
+                    if len(audio_samples) > 0:
+                        rms = np.sqrt(np.mean(audio_samples.astype(np.float32) ** 2))
+                        max_int16 = np.iinfo(np.int16).max
+                        participant_db = 20.0 * np.log10(rms / max_int16 + 1e-6)
+                        
+                        # Update participant info
+                        with streamer.participants_lock:
+                            streamer.participants[participant_id] = {
+                                'name': participant_name,
+                                'db_level': participant_db,
+                                'last_update': time.time()
+                            }
                 
-            # Add received audio to output buffer
-            audio_data = frame_event.frame.data.tobytes()
-            with streamer.output_lock:
-                streamer.output_buffer.extend(audio_data)
+                # Add received audio to output buffer
+                audio_data = frame_event.frame.data.tobytes()
+                with streamer.output_lock:
+                    streamer.output_buffer.extend(audio_data)
         
         logger.info(f"Audio receive task ended for {participant_name}. Total frames received: {frames_received}")
         
@@ -627,9 +633,16 @@ async def main(participant_name: str, enable_aec: bool = True):
     ):
         logger.info("track subscribed: %s from participant %s (%s)", publication.sid, participant.sid, participant.identity)
         if track.kind == rtc.TrackKind.KIND_AUDIO:
-            logger.info(f"Starting audio stream for participant: {participant.identity}")
-            audio_stream = rtc.AudioStream(track, sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS)
-            asyncio.ensure_future(receive_audio_frames(audio_stream, participant))
+            # Only allow playback for the first subscribed remote audio track
+            if streamer.active_remote_participant_id is None:
+                streamer.active_remote_participant_id = participant.sid
+                logger.info(f"Activating remote playback for first subscribed participant: {participant.identity}")
+                audio_stream = rtc.AudioStream(track, sample_rate=SAMPLE_RATE, num_channels=NUM_CHANNELS)
+                asyncio.ensure_future(receive_audio_frames(audio_stream, participant))
+            else:
+                logger.info(
+                    f"Ignoring additional remote audio track from {participant.identity}; active playback is participant {streamer.active_remote_participant_id}"
+                )
 
     @room.on("track_published")
     def on_track_published(
@@ -662,6 +675,12 @@ async def main(participant_name: str, enable_aec: bool = True):
             if participant.sid in streamer.participants:
                 del streamer.participants[participant.sid]
                 logger.info(f"Removed participant from tracking: {participant.identity}")
+        # If the active remote track disconnected, clear active and flush output buffer
+        if streamer.active_remote_participant_id == participant.sid:
+            logger.info("Active remote participant disconnected; releasing playback and clearing buffer")
+            streamer.active_remote_participant_id = None
+            with streamer.output_lock:
+                streamer.output_buffer.clear()
 
     @room.on("connected")
     def on_connected():
